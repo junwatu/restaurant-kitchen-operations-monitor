@@ -1,0 +1,10 @@
+node_modules/
+apps/native-bridge/.venv/
+apps/native-bridge/.env
+apps/*/node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Frontend build output
+apps/dashboard/dist/
