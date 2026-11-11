@@ -28,9 +28,10 @@ A ticket board alone tells you what was ordered. It does not tell you whether th
 ## Scope and Features
 
 - 12 stations across Grill (G01–G04), Fry (F01–F04), and Pass (P01–P04).
-- Fire and complete tickets with stable UUIDs, so retries are idempotent.
-- Live station board, active ticket table, and backlog history.
-- Ingredient inventory: 6 ingredients, receive/consume/waste lots, movement feed, stock history, low-stock flags.
+- Fire and complete tickets with caller-generated UUIDs, so retries are idempotent.
+- Dashboard: a one-line summary, then a live station board with per-ticket timers, an active ticket list, ingredient levels against par, and a receive form.
+- Ingredient inventory: 6 ingredients, receive/consume/waste lots, and low-stock flags.
+- History through the API: ticket events, backlog samples, inventory movements, and stock levels.
 - A simulator that generates one kitchen event every 5 seconds, stopped by default.
 
 The application runs in two modes:
@@ -92,7 +93,9 @@ npm install
 npm run dev:demo
 ```
 
-Open `http://127.0.0.1:3003`. The header says `DEMO · memory only`. Demo starts with three busy stations, six seeded ingredient lots (tomato and chicken already below par so the low-stock state is visible), and resets when the server stops.
+Open `http://127.0.0.1:3003`. The header says `Demo · memory only`. Demo starts with three busy stations, six seeded ingredient lots (tomato and chicken already below par so the low-stock state is visible), and resets when the server stops.
+
+To try it, tap a free station, pick a dish (the tag gets a random order number, such as `PASTA-26`), and press **Fire**. The tile shows a running timer that turns amber at 10 minutes and red at 20; press **Done** when the dish leaves. On the inventory side, **+N** next to a low ingredient prefills a delivery that brings it back to par.
 
 ### 2. Install the native dependencies (macOS)
 
@@ -164,6 +167,57 @@ All container names begin with `KITCHEN_CONTAINER_PREFIX` (default `kitchen_demo
 | `movements` | Collection | Receive/consume/waste audit projection |
 | `stock` | TimeSeries | Total qty on hand and low-ingredient count |
 
+### `stations` Collection
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `station_id` | STRING, row key | `G01`–`G04`, `F01`–`F04`, `P01`–`P04` |
+| `zone` | STRING | `Grill`, `Fry`, or `Pass` |
+| `station_type` | STRING | Lowercase zone name |
+| `enabled` | BOOL | Disabled stations cannot take tickets |
+
+### `tickets` Collection
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `ticket_id` | STRING, row key | Caller-generated UUID |
+| `station_id` | STRING | Station reference |
+| `dish_tag` | STRING | 1–16 uppercase letters, digits, spaces, or hyphens |
+| `fired_at` | TIMESTAMP | Fire time in UTC |
+| `completed_at` | TIMESTAMP | Equal to `fired_at` until the ticket is completed |
+| `active` | BOOL | True until completed |
+| `simulated` | BOOL | Whether the simulator created the ticket |
+
+### `events` Collection
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `event_id` | STRING, row key | `<ticketId>_fired` or `<ticketId>_completed` |
+| `timestamp` | TIMESTAMP | Event time in UTC |
+| `event_type` | STRING | `fired` or `completed` |
+| `station_id` | STRING | Station reference |
+| `ticket_id` | STRING | Ticket reference |
+| `dish_tag` | STRING | Copied from the ticket |
+
+### `backlog` TimeSeries
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `timestamp` | TIMESTAMP, row key | Sample time in UTC |
+| `busy` | INTEGER | Active tickets (busy stations) |
+| `capacity` | INTEGER | Enabled stations |
+
+### `sensor_<stationId>` TimeSeries
+
+One container per station, written with every backlog sample.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `timestamp` | TIMESTAMP, row key | Sample time in UTC |
+| `busy` | BOOL | Whether the station has an active ticket |
+| `ticket_id` | STRING | Active ticket, or empty when free |
+| `source` | STRING | Always `ticket_projection` in this app |
+
 ### `ingredients` Collection
 
 | Column | Type | Description |
@@ -194,7 +248,7 @@ UUID keys let distinct deliveries share a timestamp. A lot at zero stays for aud
 
 | Column | Type | Description |
 | --- | --- | --- |
-| `movement_id` | STRING, row key | Lot ID plus movement type and timestamp |
+| `movement_id` | STRING, row key | `<lotId>_receive` for receives; the caller's `consumeId` UUID for consume/waste |
 | `timestamp` | TIMESTAMP | Movement time in UTC |
 | `movement_type` | STRING | `receive`, `consume`, or `waste` |
 | `ingredient_id` | STRING | Ingredient reference |
@@ -227,37 +281,41 @@ The browser talks to `src/server.js`, which uses Node's built-in `node:http` mod
 | GET | `/api/movements` | Newest 100 inventory movements |
 | GET | `/api/stock-history?hours=24` | Stock-level history, 1–168h window |
 | POST | `/api/inventory/receive` | Receive a lot: `{lotId, ingredientId, qty, expiresInDays?}` |
-| POST | `/api/inventory/consume` | Consume or waste: `{lotId, qty, kind?}` |
+| POST | `/api/inventory/consume` | Consume or waste: `{consumeId, lotId, qty, kind?}` |
 | POST | `/api/simulator/start` | Start the simulator timer; send `{}` |
 | POST | `/api/simulator/stop` | Stop the simulator timer; send `{}` |
 
-POST routes require `Content-Type: application/json`. A new ticket or lot returns 201; a matching retry returns 200. Invalid input returns 400, unknown tickets/lots return 404, station/lot conflicts return 409, native failures return 503.
+POST routes require `Content-Type: application/json`. Firing a ticket, receiving a lot, or recording a consume/waste returns 201 the first time and 200 for a matching retry. Completing a ticket returns 200. Invalid input returns 400, unknown tickets/lots return 404, conflicts return 409 (busy station, reused ID with a different payload, empty lot, not enough stock), and native failures return 503.
 
 ### Same CRUD, different domain
 
 Every GridDB access still goes through three primitives in `python/kitchen.py`: `put` (create/update upsert), `get` (single row by key), and `read` (TQL via `container.query(tql).fetch()`). The inventory operations reuse them exactly:
 
 - `receive` puts a `lots` row, then projects a `movements` row and a `stock` sample — the same write-plus-projection shape as firing a ticket.
-- `consume` reads the lot back, decrements `qty`, deactivates at zero, and appends the movement — the same read-modify-write shape as completing a ticket.
+- `consume` first looks up its `consumeId` movement (a retry), then reads the lot back, decrements `qty`, deactivates at zero, and writes the movement — the same read-modify-write shape as completing a ticket.
 - `inventory` sums active lots per ingredient and compares against par — the same derive-state-from-authoritative-rows shape as the station board.
 
 Lots and tickets remain the authority. If a movement or history write fails, the API returns the saved row plus a warning.
 
 ### Idempotent retries
 
-Fire and receive both require caller-generated UUIDs. Retrying with the same ID and payload returns the saved row with `replayed: true`; the same ID with different content returns 409. After an uncertain response (for example a native timeout), retry with the same UUID instead of minting a new one, then reconcile from tickets/lots.
+Every write that creates something takes a caller-generated UUID: `ticketId` for fire, `lotId` for receive, and `consumeId` for consume/waste. Retrying with the same ID and payload returns the saved row with `replayed: true`; the same ID with a different payload returns 409. Completing an already completed ticket also replays.
+
+After an uncertain response (for example a native timeout), retry with the same UUID instead of minting a new one. The dashboard does this for fire and receive by keeping the pending request until it succeeds.
+
+A receive retry is checked against the original `receive` movement, not the lot's current `qty`, because the lot may already have been partly consumed. For consume, the movement row keyed by `consumeId` is the retry record. If the lot write succeeds but the movement write fails, the API returns a warning; don't retry that `consumeId`, reconcile from lots instead.
 
 ## Order and Inventory Lifecycles
 
-Ticket fees are out of scope here. The ticket lifecycle is simple: `active` distinguishes fired from completed tickets, `exited_at` starts equal to `entered_at`, and completed tickets stay queryable for the daily count.
+The ticket lifecycle is simple: `active` distinguishes fired from completed tickets. `completed_at` is written equal to `fired_at` when a ticket is fired and overwritten on completion; the API reports `completedAt: null` while a ticket is active. Completed tickets stay queryable for the daily count.
 
 Inventory adds expiry without enforcement: `expires_at` is recorded from `expiresInDays` but nothing auto-wastes expired lots in this draft. Low-stock is the live signal: on-hand below par flags the ingredient, and the `stock` TimeSeries records how many ingredients are low over time.
 
 ## Load Simulation
 
-The simulator (stopped by default) attempts one transition every 5 seconds. It completes simulated tickets first, otherwise fires a new simulated ticket at a free station. Starting it in native mode writes real sample data under the configured prefix. It stops after an error, and the API reports the message in the simulator status. The dashboard exposes start/stop in the top navigation.
+The simulator (stopped by default) attempts one transition every 5 seconds. Each tick it either completes a random simulated ticket (always when every station is busy, otherwise with 45% probability) or fires a new simulated ticket at a random free station. Manually fired tickets are never completed by the simulator. Starting it in native mode writes real sample data under the configured prefix. It stops after an error, and the API reports the message in the simulator status. The dashboard exposes start/stop in the top navigation.
 
-Inventory simulation is intentionally manual: the dashboard receive form generates new lots, and consume/waste runs through the API. A production version would tie consumption to ticket completion (a bill of materials per dish) instead of simulating the two streams independently.
+Inventory simulation is intentionally manual: the dashboard receive form creates new lots, and consume/waste runs through the API. A production version would tie consumption to ticket completion (a bill of materials per dish) instead of simulating the two streams independently.
 
 ## Query Patterns and Examples
 
@@ -269,7 +327,25 @@ curl 'http://127.0.0.1:3003/api/stock-history?hours=24'
 curl -X POST http://127.0.0.1:3003/api/inventory/receive \
   -H 'Content-Type: application/json' \
   -d '{"lotId":"7b5207cb-92ab-491e-b410-132535258ba1","ingredientId":"TOMATO","qty":25}'
+curl -X POST http://127.0.0.1:3003/api/inventory/consume \
+  -H 'Content-Type: application/json' \
+  -d '{"consumeId":"8b5207cb-92ab-491e-b410-132535258ba1","lotId":"7b5207cb-92ab-491e-b410-132535258ba1","qty":5}'
 ```
+
+### TQL used by the worker
+
+All reads go through `container.query(tql).fetch()` in `python/kitchen.py`. The browser never sends TQL. Each query is fixed in the worker, and only validated integers (like `hours`) or server-computed timestamps are put into it.
+
+| Purpose | Container | TQL |
+| --- | --- | --- |
+| Active tickets | `tickets` | `SELECT * WHERE active LIMIT 1001` |
+| Completed today | `tickets` | `SELECT * WHERE NOT active AND completed_at >= TIMESTAMP('<UTC midnight>') LIMIT 5001` |
+| Backlog window | `backlog` | `SELECT * WHERE timestamp > TIMESTAMPADD(HOUR, NOW(), -24) ORDER BY timestamp DESC LIMIT 1000` |
+| Stock window | `stock` | `SELECT * WHERE timestamp > TIMESTAMPADD(HOUR, NOW(), -24) ORDER BY timestamp DESC LIMIT 1000` |
+| Active lots | `lots` | `SELECT * WHERE active LIMIT 1001` |
+| Recent movements | `movements` | `SELECT * ORDER BY timestamp DESC LIMIT 100` |
+
+The `LIMIT 1001` reads are deliberate. Fetching one row past the expected maximum lets the worker detect overflow and fail loudly, instead of silently showing a partial board or under-counting stock. Time windows run against TimeSeries containers keyed by timestamp. Business records with stable IDs live in Collections, so retries and updates can fetch them directly with `get(key)`.
 
 ## Verification
 
@@ -279,11 +355,13 @@ npm run check
 npm test
 ```
 
-Tests cover ticket fire/complete idempotency, station conflicts, inventory receive/consume flow, over-consume conflicts, payload validation, and snapshot/inventory/history shapes. These offline tests do not prove a live GridDB Cloud connection.
+Tests cover payload validation, fire/complete/receive/consume idempotency and conflicts, empty-lot and over-consume conflicts, response shapes, origin checks, and HTTP status codes through the real server. They run against the in-memory demo store, which mirrors `python/kitchen.py`; they do not exercise the Python worker or prove a live GridDB Cloud connection.
 
 ## Production Integration
 
-Station projections and stock samples are derived from app activity, not from sensors or POS data. A real deployment needs its own ingestion: ticket firing from the POS, lot receiving from the supplier flow, expiry sweeps, and reconciliation jobs for missed projections. Keep credentials, raw TQL, and container selection off the browser, and add operator auth, HTTPS, rate limits, and retention before any public deployment.
+Station projections and stock samples are derived from app activity, not from sensors or POS data. A real deployment needs its own ingestion: ticket firing from the POS, lot receiving from the supplier flow, expiry sweeps, and reconciliation jobs for missed projections. Keep credentials, raw TQL, and container selection off the browser, and add operator auth, HTTPS, rate limits, and retention before any public deployment. The API only accepts writes from loopback origins, which is fine for a local tool but is not authentication.
+
+Two operational notes. Each fire or complete writes the ticket, an event, a backlog sample, and 12 sensor samples, opening each container per write. Over a public Cloud route that adds noticeable latency, so batch the projections or drop the per-station sensor containers if it matters. And a native timeout kills the worker on purpose, because the write outcome is unknown; the API then fails every request until it is restarted and the data reconciled.
 
 ## Future Work
 

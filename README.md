@@ -1,8 +1,8 @@
 # Restaurant Kitchen Operations Monitor (draft)
 
-Tracks kitchen stations, live tickets, completions, and backlog history on GridDB Native + Node.js.
+Tracks kitchen stations, live tickets, completions, backlog history, and ingredient inventory on GridDB Native + Node.js.
 
-Stations: 12 across Grill (G), Fry (F), Pass (P). Tickets are fired to a station and completed when the dish leaves the pass. A simulator generates one fire/complete event every 5 seconds (stopped by default).
+Stations: 12 across Grill (G), Fry (F), Pass (P). Tickets are fired to a station and completed when the dish leaves the station. A simulator generates one fire/complete event every 5 seconds (stopped by default).
 
 ## Project structure
 
@@ -18,9 +18,14 @@ restaurant-kitchen-operations-monitor/
 │   │   └── check.mjs
 │   ├── dashboard/
 │   │   ├── package.json
+│   │   ├── vite.config.js
 │   │   ├── index.html
-│   │   ├── app.js
-│   │   └── styles.css
+│   │   └── src/
+│   │       ├── main.jsx
+│   │       ├── App.jsx
+│   │       ├── index.css
+│   │       ├── lib/utils.js
+│   │       └── components/ui/  (alert, badge, button, card, input, table)
 │   └── native-bridge/
 │       ├── package.json
 │       ├── .env.example
@@ -43,7 +48,7 @@ restaurant-kitchen-operations-monitor/
     └── assets/README.md
 ```
 
-Browser dashboard is a React app (Vite + Tailwind CSS + shadcn-style components in `dashboard/src/components/ui`). The workspace commands build it to `dashboard/dist`, which the Node API serves. The API server itself still uses only built-in Node modules.
+Browser dashboard is a React app (Vite + Tailwind CSS + shadcn-style components in `dashboard/src/components/ui`). It shows a one-line summary, then two boards side by side: the kitchen (station board with per-ticket timers, a fire form whose dish buttons fill a tag like `RAMEN-37`, and the active ticket list) and inventory (ingredient levels against par and a receive form). Light mode by default; the header moon button switches to dark. Consume/waste, history, events, movements and stock history are API-only. The workspace commands build it to `dashboard/dist`, which the Node API serves. The API server itself still uses only built-in Node modules.
 
 ## Quick preview without GridDB
 
@@ -55,7 +60,7 @@ npm install
 npm run dev:demo
 ```
 
-Open **http://127.0.0.1:3003**. The header says `DEMO · memory only`. Demo starts with a few active tickets and resets when the server stops.
+Open **http://127.0.0.1:3003**. The header says `Demo · memory only`. Demo starts with a few active tickets and resets when the server stops.
 
 ## Native GridDB Cloud setup (macOS)
 
@@ -104,7 +109,7 @@ Both domains run on the same native CRUD bridge (`put`/`get`/`query` through the
 
 ## Schema and data ownership
 
-All names start with `KITCHEN_CONTAINER_PREFIX`. Ticket containers are unchanged from the draft; inventory adds:
+All names start with `KITCHEN_CONTAINER_PREFIX`.
 
 | Suffix | Container | Key | Purpose |
 | --- | --- | --- | --- |
@@ -115,10 +120,10 @@ All names start with `KITCHEN_CONTAINER_PREFIX`. Ticket containers are unchanged
 | `sensor_G01` … | TimeSeries | Timestamp | Per-station busy state, ticket ID, source |
 | `ingredients` | Collection | `ingredient_id` | Name, unit, par level, enabled state |
 | `lots` | Collection | UUID `lot_id` | Ingredient, qty, received/expiry timestamps, active state |
-| `movements` | Collection | `lot_id` + type | Receive/consume/waste audit projection |
+| `movements` | Collection | `<lotId>_receive` or `consumeId` | Receive/consume/waste audit projection; also the consume retry record |
 | `stock` | TimeSeries | Timestamp | Total qty on hand and low-ingredient count |
 
-Tickets are authoritative. Event/backlog projections are best-effort; on projection failure the API returns the saved ticket plus a warning.
+Tickets and lots are authoritative. Event, backlog, sensor, movement, and stock projections are best-effort; on projection failure the API returns the saved row plus a warning.
 
 ## API reference
 
@@ -134,7 +139,7 @@ Tickets are authoritative. Event/backlog projections are best-effort; on project
 | GET | `/api/movements` | Newest 100 receive/consume/waste movements |
 | GET | `/api/stock-history?hours=24` | Stock-level history, 1–168h window |
 | POST | `/api/inventory/receive` | Receive a lot: `{lotId, ingredientId, qty, expiresInDays?}` |
-| POST | `/api/inventory/consume` | Consume/waste: `{lotId, qty, kind?}` |
+| POST | `/api/inventory/consume` | Consume/waste: `{consumeId, lotId, qty, kind?}` |
 | POST | `/api/simulator/start` | Start simulation; send `{}` |
 | POST | `/api/simulator/stop` | Stop simulation; send `{}` |
 
@@ -147,7 +152,7 @@ curl -X POST http://127.0.0.1:3003/api/tickets/complete \
   -d '{"ticketId":"5b5207cb-92ab-491e-b410-132535258ba1"}'
 ```
 
-Matching retries return the same ticket. Conflicting station/dish returns 409; bad input 400; missing ticket 404; native failures 503.
+Fire, receive, and consume take caller-generated UUIDs (`ticketId`, `lotId`, `consumeId`). The first call returns 201; a matching retry returns 200 with `replayed: true`; the same ID with a different payload returns 409. Busy station, empty lot, or not enough stock also return 409; bad input 400; missing ticket/lot 404; native failures 503.
 
 ## Verification
 
@@ -157,4 +162,4 @@ npm run check
 npm test
 ```
 
-Offline checks only; they do not prove a live GridDB Cloud connection.
+Offline checks only. Tests run against the in-memory demo store (which mirrors `python/kitchen.py`) and the real HTTP server; they do not prove a live GridDB Cloud connection.

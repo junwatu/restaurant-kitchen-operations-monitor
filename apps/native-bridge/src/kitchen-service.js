@@ -1,25 +1,20 @@
-const STATIONS = [];
-for (const [zone, type] of [['Grill', 'grill'], ['Fry', 'fry'], ['Pass', 'pass']]) {
-  const prefix = zone[0].toUpperCase();
-  for (let n = 1; n <= 4; n++) STATIONS.push(`${prefix}0${n}`);
-}
 const STATION_RE = /^(G0[1-4]|F0[1-4]|P0[1-4])$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function invalid(message) { throw Object.assign(new Error(message), { name: 'ValueError' }); }
 export function firePayload(body) {
   const ticketId = body.ticketId;
   const stationId = body.stationId;
   const dishTag = typeof body.dishTag === 'string' ? body.dishTag.trim().toUpperCase() : '';
-  if (typeof ticketId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ticketId)) invalid('Provide a UUID ticketId so retries are idempotent');
+  if (typeof ticketId !== 'string' || !UUID_RE.test(ticketId)) invalid('Provide a UUID ticketId so retries are idempotent');
   if (typeof stationId !== 'string' || !STATION_RE.test(stationId)) invalid('Invalid kitchen station');
   if (!/^[A-Z0-9 -]{1,16}$/.test(dishTag)) invalid('Dish tag must contain 1–16 letters, digits, spaces or hyphens');
   return { ticketId: ticketId.toLowerCase(), stationId, dishTag };
 }
 export function completePayload(body) {
-  if (typeof body.ticketId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.ticketId)) invalid('Invalid ticketId');
+  if (typeof body.ticketId !== 'string' || !UUID_RE.test(body.ticketId)) invalid('Invalid ticketId');
   return { ticketId: body.ticketId.toLowerCase() };
 }
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function receivePayload(body) {
   if (typeof body.lotId !== 'string' || !UUID_RE.test(body.lotId)) invalid('Provide a UUID lotId so receives are idempotent');
   if (typeof body.ingredientId !== 'string' || !/^[A-Z]{2,12}$/.test(body.ingredientId)) invalid('Invalid ingredient');
@@ -29,11 +24,12 @@ export function receivePayload(body) {
   return { lotId: body.lotId.toLowerCase(), ingredientId: body.ingredientId, qty: body.qty, expiresInDays };
 }
 export function consumePayload(body) {
+  if (typeof body.consumeId !== 'string' || !UUID_RE.test(body.consumeId)) invalid('Provide a UUID consumeId so consume/waste retries are idempotent');
   if (typeof body.lotId !== 'string' || !UUID_RE.test(body.lotId)) invalid('Invalid lotId');
   if (!Number.isInteger(body.qty) || body.qty < 1 || body.qty > 100000) invalid('qty must be an integer from 1 to 100000');
   const kind = body.kind ?? 'consume';
   if (kind !== 'consume' && kind !== 'waste') invalid('kind must be consume or waste');
-  return { lotId: body.lotId.toLowerCase(), qty: body.qty, kind };
+  return { consumeId: body.consumeId.toLowerCase(), lotId: body.lotId.toLowerCase(), qty: body.qty, kind };
 }
 export class KitchenService {
   #timer;

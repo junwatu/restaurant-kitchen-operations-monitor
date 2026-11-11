@@ -49,9 +49,6 @@ async function body(req) {
     return value;
   } catch { throw Object.assign(new Error('Provide a JSON object'), { name: 'ValueError' }); }
 }
-function normalizeTicket(input) {
-  return { ticketId: input.ticketId, stationId: input.stationId, dishTag: input.dishTag };
-}
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 export function isAllowedOrigin(originHeader, configuredOrigin) {
@@ -94,16 +91,11 @@ export function createKitchenServer(store, { origin = 'http://127.0.0.1:3003' } 
       else if (req.method === 'GET' && url.pathname === '/api/inventory') result = await service.inventory();
       else if (req.method === 'GET' && url.pathname === '/api/movements') result = await service.movements();
       else if (req.method === 'GET' && url.pathname === '/api/stock-history') result = await service.stockHistory(Number(url.searchParams.get('hours') ?? 24));
-      else if (req.method === 'POST' && url.pathname === '/api/inventory/receive') result = await service.receive(await body(req));
-      else if (req.method === 'POST' && url.pathname === '/api/inventory/consume') result = await service.consume(await body(req));
-      else if (req.method === 'POST' && url.pathname === '/api/tickets/fire') {
-        const n = normalizeTicket(await body(req));
-        result = await service.fire({ ticketId: n.ticketId, stationId: n.stationId, dishTag: n.dishTag }); status = result.replayed ? 200 : 201;
-      } else if (req.method === 'POST' && url.pathname === '/api/tickets/complete') {
-        const raw = await body(req);
-        const id = raw.ticketId;
-        result = await service.complete({ ticketId: id });
-      }
+      // Creating writes return 201 the first time and 200 for a matching retry (replayed: true).
+      else if (req.method === 'POST' && url.pathname === '/api/tickets/fire') { result = await service.fire(await body(req)); status = result.replayed ? 200 : 201; }
+      else if (req.method === 'POST' && url.pathname === '/api/tickets/complete') result = await service.complete(await body(req));
+      else if (req.method === 'POST' && url.pathname === '/api/inventory/receive') { result = await service.receive(await body(req)); status = result.replayed ? 200 : 201; }
+      else if (req.method === 'POST' && url.pathname === '/api/inventory/consume') { result = await service.consume(await body(req)); status = result.replayed ? 200 : 201; }
       else if (req.method === 'POST' && url.pathname === '/api/simulator/start') { await body(req); result = service.startSimulator(); }
       else if (req.method === 'POST' && url.pathname === '/api/simulator/stop') { await body(req); result = service.stopSimulator(); }
       else { json(res, 404, { error: 'Endpoint not found' }); return; }
