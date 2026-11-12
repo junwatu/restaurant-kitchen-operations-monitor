@@ -89,7 +89,9 @@ npm run dev:griddb
 npm run dev:live
 ```
 
-`doctor` checks local prerequisites. `init` creates containers and refuses incompatible schemas. `seed` adds missing station metadata without clearing tickets. `dev:live` refuses to start if the database is unreachable or no stations exist.
+`doctor` checks local prerequisites. `init` creates containers and refuses incompatible schemas. `seed` adds missing stations and ingredients without clearing tickets or lots. `dev:griddb` makes one real request to confirm the connection. `dev:live` refuses to start if the database is unreachable or no stations exist.
+
+A timeout on `init` or `dev:griddb` usually means your IP is not on the GridDB Cloud access list. A live database starts with no stock (seed creates no lots), so receive a delivery for each ingredient with **+N** before completing dishes, or each completion warns that stock is short.
 
 ## How the native bridge works
 

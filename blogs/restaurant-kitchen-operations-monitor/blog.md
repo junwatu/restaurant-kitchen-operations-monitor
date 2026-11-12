@@ -100,6 +100,8 @@ To try it, tap a free station, pick a dish (the tag gets a random order number, 
 
 ### 2. Install the native dependencies (macOS)
 
+Run the remaining commands from `apps/`. The setup script needs [Homebrew](https://brew.sh).
+
 ```bash
 npm run setup:mac
 ```
@@ -110,7 +112,7 @@ Then install the Cloud JAR:
 npm run install:cloud-jar -- "/path/to/griddb-ee-java-lib-5.9.0-linux.x86_64.rpm"
 ```
 
-The runtime directory should contain `gridstore.jar`, `gridstore-arrow.jar`, `arrow-memory-netty.jar`, and `gridstore-advanced.jar`.
+The script accepts either the Cloud library RPM or an already extracted `gridstore-advanced.jar`. The runtime directory `native-bridge/lib/` should contain `gridstore.jar`, `gridstore-arrow.jar`, `arrow-memory-netty.jar`, and `gridstore-advanced.jar`.
 
 ### 3. Configure environment variables
 
@@ -128,7 +130,11 @@ npm run dev:griddb
 npm run dev:live
 ```
 
-`doctor` checks local prerequisites. `init` creates the containers and refuses incompatible schemas without deleting data. `seed` adds missing stations and ingredients without clearing tickets or lots. `dev:live` refuses to start if the database is unreachable or no stations exist.
+`doctor` checks local prerequisites. `init` creates the containers and refuses incompatible schemas without deleting data. `seed` adds missing stations and ingredients without clearing tickets or lots. `dev:griddb` makes one real request to confirm the connection. `dev:live` refuses to start if the database is unreachable or no stations exist.
+
+If `init` or `dev:griddb` times out, your outbound IP is usually missing from the GridDB Cloud access list. Add it in the portal and retry.
+
+Unlike the demo, a live database starts with no stock: `seed` creates the ingredients but no lots. Before you complete dishes, use **+N** in the inventory panel to receive a delivery for each ingredient. Otherwise each completed dish shows a "not enough" warning.
 
 ## Runtime Design
 
