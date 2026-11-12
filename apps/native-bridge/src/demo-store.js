@@ -3,6 +3,16 @@ import { randomUUID } from 'node:crypto';
 function fail(name, message) { throw Object.assign(new Error(message), { name }); }
 const DAY_MS = 86_400_000;
 const DISHES = ['BURGER', 'FRIES', 'RAMEN', 'SALAD', 'PASTA', 'STEAK'];
+// Mirrors Kitchen.RECIPES in python/kitchen.py: whole units of each ingredient per dish,
+// keyed by the dish tag prefix (BURGER-12 -> BURGER). Demo-sized so stock visibly drains.
+export const RECIPES = {
+  BURGER: { CHEESE: 1, TOMATO: 1 },
+  FRIES: { OIL: 1 },
+  RAMEN: { CHICKEN: 1, FLOUR: 1 },
+  SALAD: { TOMATO: 1, BASIL: 20 },
+  PASTA: { FLOUR: 1, TOMATO: 1, CHEESE: 1, BASIL: 10 },
+  STEAK: { OIL: 1, BASIL: 10 },
+};
 
 // Explicit preview mode. Nothing in this class connects to GridDB or persists.
 // Response shapes and retry rules match python/kitchen.py, so the dashboard and
@@ -111,12 +121,45 @@ export class DemoStore {
   complete({ ticketId }) {
     const ticket = this.#tickets.get(ticketId);
     if (!ticket) fail('LookupError', 'Ticket not found');
-    if (!ticket.active) return { ticket: structuredClone(ticket), replayed: true, warnings: [] };
+    // Replays stop here, before consumption, so a dish never uses ingredients twice.
+    if (!ticket.active) return { ticket: structuredClone(ticket), replayed: true, consumed: [], warnings: [] };
     ticket.completedAt = this.now().toISOString();
     ticket.active = false;
     this.#events.push({ id: `${ticketId}_completed`, timestamp: ticket.completedAt, type: 'completed', stationId: ticket.stationId, ticketId, dishTag: ticket.dishTag });
     this.#record();
-    return { ticket: structuredClone(ticket), replayed: false, warnings: [] };
+    const { consumed, warnings } = this.#consumeForTicket(ticket);
+    return { ticket: structuredClone(ticket), replayed: false, consumed, warnings };
+  }
+
+  // Uses a completed ticket's ingredients, first-expiring lot first. Shortfalls are
+  // warnings, not errors: the dish has already left the station.
+  #consumeForTicket(ticket) {
+    const recipe = RECIPES[ticket.dishTag.split('-')[0].trim()];
+    if (!recipe) return { consumed: [], warnings: [] };
+    const consumed = [];
+    const warnings = [];
+    const lots = [...this.#lots.values()].filter(l => l.active)
+      .sort((a, b) => a.expiresAt.localeCompare(b.expiresAt) || a.id.localeCompare(b.id));
+    for (const [ingredientId, need] of Object.entries(recipe)) {
+      let used = 0;
+      for (const lot of lots) {
+        if (used === need) break;
+        if (lot.ingredientId !== ingredientId || !lot.active || lot.qty <= 0) continue;
+        const take = Math.min(need - used, lot.qty);
+        lot.qty -= take;
+        if (lot.qty === 0) lot.active = false;
+        used += take;
+        const id = `${ticket.id}_${ingredientId}_${lot.id}`;
+        this.#movements.set(id, { id, timestamp: ticket.completedAt, type: 'consume', ingredientId, lotId: lot.id, qty: take });
+      }
+      if (used) consumed.push({ ingredientId, qty: used });
+      if (used < need) {
+        const name = ingredientId[0] + ingredientId.slice(1).toLowerCase();
+        warnings.push(`Not enough ${name} for ${ticket.dishTag}: short by ${need - used}.`);
+      }
+    }
+    this.#recordStock();
+    return { consumed, warnings };
   }
 
   simulate() {

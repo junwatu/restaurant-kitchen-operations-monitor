@@ -68,6 +68,44 @@ test('consume is idempotent per consumeId and empty lots conflict', async () => 
   assert.deepEqual(moves.slice(0, 3).map(m => m.type), ['waste', 'consume', 'receive']);
 });
 
+test('completing a dish uses its recipe from the first-expiring lot, once', async () => {
+  const store = new DemoStore({ now: NOW });
+  const onHand = async id => (await store.request('inventory')).items.find(i => i.id === id).onHand;
+  // A short-dated tomato lot (2 days) must be used before the seeded 7-day lot.
+  await store.request('receive', { lotId: LOT, ingredientId: 'TOMATO', qty: 1, expiresInDays: 2 });
+  const [tomato, cheese] = [await onHand('TOMATO'), await onHand('CHEESE')];
+  await store.request('fire', { ticketId: T1, stationId: 'G01', dishTag: 'BURGER-12' });
+  const done = await store.request('complete', { ticketId: T1 });
+  assert.deepEqual(done.consumed, [{ ingredientId: 'CHEESE', qty: 1 }, { ingredientId: 'TOMATO', qty: 1 }]);
+  assert.deepEqual(done.warnings, []);
+  assert.equal(await onHand('TOMATO'), tomato - 1);
+  assert.equal(await onHand('CHEESE'), cheese - 1);
+  const moves = await store.request('movements');
+  const tomatoMove = moves.find(m => m.id === `${T1}_TOMATO_${LOT}`);
+  assert.equal(tomatoMove?.type, 'consume', 'tomato came from the short-dated lot');
+  // A completion retry replays without consuming again.
+  const retry = await store.request('complete', { ticketId: T1 });
+  assert.equal(retry.replayed, true);
+  assert.deepEqual(retry.consumed, []);
+  assert.equal(await onHand('TOMATO'), tomato - 1);
+});
+
+test('a shortfall is a warning and dishes without a recipe consume nothing', async () => {
+  const store = new DemoStore({ now: NOW });
+  const oilLot = (await store.request('movements')).find(m => m.ingredientId === 'OIL').lotId;
+  await store.request('consume', { consumeId: C1, lotId: oilLot, qty: 12, kind: 'waste' });
+  await store.request('fire', { ticketId: T1, stationId: 'G01', dishTag: 'FRIES-01' });
+  const done = await store.request('complete', { ticketId: T1 });
+  assert.equal(done.ticket.active, false, 'the dish still completes');
+  assert.deepEqual(done.consumed, []);
+  assert.match(done.warnings[0], /Not enough Oil for FRIES-01: short by 1/);
+  const before = (await store.request('inventory')).items;
+  const seeded = (await store.request('snapshot')).tickets.find(t => t.dishTag.startsWith('DISH-'));
+  const plain = await store.request('complete', { ticketId: seeded.id });
+  assert.deepEqual(plain.consumed, []);
+  assert.deepEqual((await store.request('inventory')).items, before);
+});
+
 test('snapshot, inventory, events and history shapes', async () => {
   const store = new DemoStore({ now: NOW });
   const kitchen = await store.request('snapshot');

@@ -31,6 +31,7 @@ A ticket board alone tells you what was ordered. It does not tell you whether th
 - Fire and complete tickets with caller-generated UUIDs, so retries are idempotent.
 - Dashboard: a one-line summary, then a live station board with per-ticket timers, an active ticket list, ingredient levels against par, and a receive form.
 - Ingredient inventory: 6 ingredients, receive/consume/waste lots, and low-stock flags.
+- Completing a dish uses its recipe: each dish has a bill of materials, and completion draws those ingredients from the first-expiring lots.
 - History through the API: ticket events, backlog samples, inventory movements, and stock levels.
 - A simulator that generates one kitchen event every 5 seconds, stopped by default.
 
@@ -276,7 +277,7 @@ The browser talks to `src/server.js`, which uses Node's built-in `node:http` mod
 | GET | `/api/events` | Newest 100 ticket events |
 | GET | `/api/history?hours=24` | Up to 1,000 backlog samples, 1–168h window |
 | POST | `/api/tickets/fire` | Fire a ticket: `{ticketId, stationId, dishTag}` |
-| POST | `/api/tickets/complete` | Complete a ticket: `{ticketId}` |
+| POST | `/api/tickets/complete` | Complete a ticket and use its recipe's ingredients: `{ticketId}` |
 | GET | `/api/inventory` | Ingredients with on-hand qty and low flags |
 | GET | `/api/movements` | Newest 100 inventory movements |
 | GET | `/api/stock-history?hours=24` | Stock-level history, 1–168h window |
@@ -293,13 +294,14 @@ Every GridDB access still goes through three primitives in `python/kitchen.py`: 
 
 - `receive` puts a `lots` row, then projects a `movements` row and a `stock` sample — the same write-plus-projection shape as firing a ticket.
 - `consume` first looks up its `consumeId` movement (a retry), then reads the lot back, decrements `qty`, deactivates at zero, and writes the movement — the same read-modify-write shape as completing a ticket.
+- `complete` marks the ticket done, then runs `consume_for_ticket`: it looks up the dish's recipe by tag prefix (`BURGER-12` → `BURGER`), reads active lots sorted by `expires_at`, decrements them first-expiring first, and writes one `consume` movement per lot it draws from, keyed `<ticketId>_<ingredientId>_<lotId>`.
 - `inventory` sums active lots per ingredient and compares against par — the same derive-state-from-authoritative-rows shape as the station board.
 
 Lots and tickets remain the authority. If a movement or history write fails, the API returns the saved row plus a warning.
 
 ### Idempotent retries
 
-Every write that creates something takes a caller-generated UUID: `ticketId` for fire, `lotId` for receive, and `consumeId` for consume/waste. Retrying with the same ID and payload returns the saved row with `replayed: true`; the same ID with a different payload returns 409. Completing an already completed ticket also replays.
+Every write that creates something takes a caller-generated UUID: `ticketId` for fire, `lotId` for receive, and `consumeId` for consume/waste. Retrying with the same ID and payload returns the saved row with `replayed: true`; the same ID with a different payload returns 409. Completing an already completed ticket also replays, and the replay returns before ingredient consumption, so a dish never uses its ingredients twice.
 
 After an uncertain response (for example a native timeout), retry with the same UUID instead of minting a new one. The dashboard does this for fire and receive by keeping the pending request until it succeeds.
 
@@ -309,13 +311,26 @@ A receive retry is checked against the original `receive` movement, not the lot'
 
 The ticket lifecycle is simple: `active` distinguishes fired from completed tickets. `completed_at` is written equal to `fired_at` when a ticket is fired and overwritten on completion; the API reports `completedAt: null` while a ticket is active. Completed tickets stay queryable for the daily count.
 
+Completion links the two lifecycles. The ticket is saved first because it is authoritative; ingredient use follows as a best-effort step like the other projections. If stock runs short, the dish still completes and the API returns a warning such as `Not enough Tomato for BURGER-12: short by 1.`, because the food has already left the station. Dishes without a recipe (any tag whose prefix is not one of the six dishes) consume nothing.
+
 Inventory adds expiry without enforcement: `expires_at` is recorded from `expiresInDays` but nothing auto-wastes expired lots in this draft. Low-stock is the live signal: on-hand below par flags the ingredient, and the `stock` TimeSeries records how many ingredients are low over time.
 
 ## Load Simulation
 
 The simulator (stopped by default) attempts one transition every 5 seconds. Each tick it either completes a random simulated ticket (always when every station is busy, otherwise with 45% probability) or fires a new simulated ticket at a random free station. Manually fired tickets are never completed by the simulator. Starting it in native mode writes real sample data under the configured prefix. It stops after an error, and the API reports the message in the simulator status. The dashboard exposes start/stop in the top navigation.
 
-Inventory simulation is intentionally manual: the dashboard receive form creates new lots, and consume/waste runs through the API. A production version would tie consumption to ticket completion (a bill of materials per dish) instead of simulating the two streams independently.
+Because completion consumes ingredients, running the simulator drains stock: every simulated completion takes its dish's recipe out of the lots. Receiving is still manual, through the dashboard's receive form (the **+N** button prefills the amount that brings an ingredient back to par), and ad-hoc consume/waste still runs through the API.
+
+The recipes live in `Kitchen.RECIPES` in `python/kitchen.py` (mirrored in the demo store). Quantities are whole units of each ingredient, because lot `qty` is an `INTEGER` column, so portions are demo-sized, 1 kg of cheese per burger, to make the bars move visibly:
+
+| Dish | Uses |
+| --- | --- |
+| BURGER | 1 kg cheese, 1 kg tomato |
+| FRIES | 1 L oil |
+| RAMEN | 1 kg chicken, 1 kg flour |
+| SALAD | 1 kg tomato, 20 g basil |
+| PASTA | 1 kg flour, 1 kg tomato, 1 kg cheese, 10 g basil |
+| STEAK | 1 L oil, 10 g basil |
 
 ## Query Patterns and Examples
 
@@ -355,17 +370,17 @@ npm run check
 npm test
 ```
 
-Tests cover payload validation, fire/complete/receive/consume idempotency and conflicts, empty-lot and over-consume conflicts, response shapes, origin checks, and HTTP status codes through the real server. They run against the in-memory demo store, which mirrors `python/kitchen.py`; they do not exercise the Python worker or prove a live GridDB Cloud connection.
+Tests cover payload validation, fire/complete/receive/consume idempotency and conflicts, empty-lot and over-consume conflicts, recipe consumption on completion (first-expiring lot first, no double use on retry, shortfall warnings), response shapes, origin checks, and HTTP status codes through the real server. They run against the in-memory demo store, which mirrors `python/kitchen.py`; they do not exercise the Python worker or prove a live GridDB Cloud connection.
 
 ## Production Integration
 
 Station projections and stock samples are derived from app activity, not from sensors or POS data. A real deployment needs its own ingestion: ticket firing from the POS, lot receiving from the supplier flow, expiry sweeps, and reconciliation jobs for missed projections. Keep credentials, raw TQL, and container selection off the browser, and add operator auth, HTTPS, rate limits, and retention before any public deployment. The API only accepts writes from loopback origins, which is fine for a local tool but is not authentication.
 
-Two operational notes. Each fire or complete writes the ticket, an event, a backlog sample, and 12 sensor samples, opening each container per write. Over a public Cloud route that adds noticeable latency, so batch the projections or drop the per-station sensor containers if it matters. And a native timeout kills the worker on purpose, because the write outcome is unknown; the API then fails every request until it is restarted and the data reconciled.
+Two operational notes. Each fire or complete writes the ticket, an event, a backlog sample, and 12 sensor samples, and a complete also writes the lots and movements its recipe draws from, opening each container per write. Over a public Cloud route that adds noticeable latency, so batch the projections or drop the per-station sensor containers if it matters. And a native timeout kills the worker on purpose, because the write outcome is unknown; the API then fails every request until it is restarted and the data reconciled.
 
 ## Future Work
 
-- Per-dish bill of materials: completing a ticket consumes ingredient qty automatically.
+- Real portion sizes: store quantities in grams and millilitres so recipes can use realistic amounts, and manage recipes as data instead of code.
 - Expiry sweeps: nightly job that wastes expired lots and records the movement.
 - Par-level tuning per weekday and supplier lead times.
 - Waste analytics: waste share per ingredient and per station.

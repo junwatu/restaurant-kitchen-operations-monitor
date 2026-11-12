@@ -134,7 +134,7 @@ Tickets and lots are authoritative. Event, backlog, sensor, movement, and stock 
 | GET | `/api/events` | Newest 100 events |
 | GET | `/api/history?hours=24` | Newest 1,000 backlog samples, 1–168h window |
 | POST | `/api/tickets/fire` | Fire a ticket: `{ticketId, stationId, dishTag}` |
-| POST | `/api/tickets/complete` | Complete a ticket: `{ticketId}` |
+| POST | `/api/tickets/complete` | Complete a ticket and use its recipe's ingredients (first-expiring lots first): `{ticketId}` |
 | GET | `/api/inventory` | Ingredients with on-hand qty and low flags |
 | GET | `/api/movements` | Newest 100 receive/consume/waste movements |
 | GET | `/api/stock-history?hours=24` | Stock-level history, 1–168h window |

@@ -174,12 +174,14 @@ class Kitchen:
         if row is None:
             raise LookupError("Ticket not found")
         if not row[5]:
-            return {"ticket": ticket_json(row), "replayed": True, "warnings": []}
+            # Replays stop here, before consumption, so a dish never uses ingredients twice.
+            return {"ticket": ticket_json(row), "replayed": True, "consumed": [], "warnings": []}
         now = utc_now()
         row[4], row[5] = now, False
         self.put("tickets", row)
         warnings = self.project_event(row, "completed", now) + self.record_telemetry(now)
-        return {"ticket": ticket_json(row), "replayed": False, "warnings": warnings}
+        consumed, consume_warnings = self.consume_for_ticket(row, now)
+        return {"ticket": ticket_json(row), "replayed": False, "consumed": consumed, "warnings": warnings + consume_warnings}
 
     def project_event(self, row, kind, now):
         try:
@@ -228,6 +230,58 @@ class Kitchen:
     # ---- inventory -----------------------------------------------------
 
     DEFAULT_INGREDIENTS = (("TOMATO", "Tomato", "kg", 20), ("CHEESE", "Cheese", "kg", 15), ("FLOUR", "Flour", "kg", 30), ("CHICKEN", "Chicken", "kg", 25), ("BASIL", "Basil", "g", 500), ("OIL", "Oil", "L", 10))
+
+    # Bill of materials per dish, keyed by the dish tag prefix (BURGER-12 -> BURGER).
+    # Quantities are whole units of each ingredient (kg, g, L) because lot qty is an
+    # INTEGER column; they are demo-sized so stock visibly drains under the simulator.
+    RECIPES = {
+        "BURGER": {"CHEESE": 1, "TOMATO": 1},
+        "FRIES": {"OIL": 1},
+        "RAMEN": {"CHICKEN": 1, "FLOUR": 1},
+        "SALAD": {"TOMATO": 1, "BASIL": 20},
+        "PASTA": {"FLOUR": 1, "TOMATO": 1, "CHEESE": 1, "BASIL": 10},
+        "STEAK": {"OIL": 1, "BASIL": 10},
+    }
+
+    def consume_for_ticket(self, row, now):
+        """Use a completed ticket's ingredients, first-expiring lot first.
+
+        The ticket is already saved as completed, so this is best effort like the other
+        projections: a shortfall or failed write becomes a warning instead of undoing
+        the completion. Unknown dishes (no recipe) consume nothing.
+        """
+        recipe = self.RECIPES.get(row[2].split("-")[0].strip())
+        if not recipe:
+            return [], []
+        consumed, warnings = [], []
+        try:
+            lots = sorted((list(r) for r in self.lots_active()), key=lambda r: (r[4], r[0]))
+            for iid, need in recipe.items():
+                used = 0
+                for lot in lots:
+                    if used == need:
+                        break
+                    if lot[1] != iid or not lot[5] or lot[2] <= 0:
+                        continue
+                    take = min(need - used, lot[2])
+                    lot[2] -= take
+                    if lot[2] == 0:
+                        lot[5] = False
+                    self.put("lots", lot)
+                    used += take
+                    try:
+                        # Keyed by ticket + ingredient + lot, so the audit trail links back to the dish.
+                        self.put("movements", [f"{row[0]}_{iid}_{lot[0]}", now, "consume", iid, lot[0], take])
+                    except Exception:
+                        warnings.append("Lot updated, but a consume movement projection failed. Reconcile from lots.")
+                if used:
+                    consumed.append({"ingredientId": iid, "qty": used})
+                if used < need:
+                    warnings.append(f"Not enough {iid.title()} for {row[2]}: short by {need - used}.")
+        except Exception:
+            warnings.append("Ticket completed, but ingredient consumption is incomplete. Reconcile from lots.")
+        warnings += self.record_stock(now)
+        return consumed, warnings
 
     def seed_ingredients(self):
         created = 0

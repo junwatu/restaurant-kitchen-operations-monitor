@@ -120,8 +120,14 @@ export default function App() {
     if (completingIds.has(ticket.id)) return;
     setCompletingIds(s => new Set(s).add(ticket.id));
     try {
-      await api('/api/tickets/complete', { ticketId: ticket.id });
-      notify(`${ticket.dishTag} completed at ${ticket.stationId}.`);
+      const result = await api('/api/tickets/complete', { ticketId: ticket.id });
+      // The server uses the dish's recipe on completion; show what came out of stock.
+      const items = Object.fromEntries((inventory?.items ?? []).map(i => [i.id, i]));
+      const used = (result.consumed ?? [])
+        .map(c => `${c.qty} ${items[c.ingredientId]?.unit ?? ''} ${items[c.ingredientId]?.name ?? c.ingredientId}`.replace(/\s+/g, ' '))
+        .join(', ');
+      notify(`${ticket.dishTag} completed at ${ticket.stationId}.${used ? ` Used ${used}.` : ''}`);
+      for (const warning of result.warnings ?? []) notify(warning, true);
       await settle();
     } catch (error) {
       notify(error.message, true);
