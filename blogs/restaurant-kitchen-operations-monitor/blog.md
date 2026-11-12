@@ -469,11 +469,20 @@ Completing a dish works the same way: if the ticket is already done, the server 
 
 *Figure 8. How the Kitchen Monitor works: a dish from fire to restock, and what each step writes to GridDB.*
 
-The ticket lifecycle is simple: `active` distinguishes fired from completed tickets. `completed_at` is written equal to `fired_at` when a ticket is fired and overwritten on completion; the API reports `completedAt: null` while a ticket is active. Completed tickets stay queryable for the daily count.
+Figure 8 follows one dish, `BURGER-12`, from the moment a cook fires it to the moment its ingredients are restocked.
 
-Completion links the two lifecycles. The ticket is saved first because it is authoritative; ingredient use follows as a best-effort step like the other projections. It takes each recipe ingredient from the earliest-expiring active lots, writes one `consume` movement per lot it draws from, marks a lot inactive when it reaches zero, and records a `stock` sample. If stock runs short, the dish still completes and the API returns a warning such as `Not enough Tomato for BURGER-12: short by 1.`, because the food has already left the station. Dishes without a recipe (any tag whose prefix is not one of the six dishes) consume nothing.
+1. **Fire the dish.** The cook picks a free grill station and taps **Fire**. A new row goes into `tickets` with `active = true`, and the station turns busy on the board. (`completed_at` gets a placeholder copy of `fired_at`, because the column can't be empty. The API shows it as `null` until the dish is done.)
+2. **Watch the timer.** The board counts up from `fired_at`. The station turns amber after 10 minutes and red after 20.
+3. **Mark it done.** When the burger leaves the station, the cook taps **Done**. The ticket is updated to `active = false` with the real `completed_at`, and the station is free again. The row is kept, so it still counts toward "completed today".
+4. **Use the ingredients.** The server looks up the burger's recipe (1 kg cheese, 1 kg tomato) and takes each amount from the lots that expire soonest. Every lot it draws from gets a `consume` row in `movements`, a lot that reaches zero is marked inactive, and a new `stock` sample records the totals.
+5. **Spot low stock.** The board adds up each ingredient's active lots and compares the total with its par level. Anything below par is flagged as low.
+6. **Restock.** The cook taps **+N** next to a low ingredient, which fills in the amount that brings it back to par, and submits the delivery. That creates a new lot (expiring in 7 days by default), a `receive` movement, and another `stock` sample.
 
-Inventory adds expiry without enforcement: `expires_at` is recorded from `expiresInDays` but nothing auto-wastes expired lots in this draft. An expired lot still counts toward on-hand, and because consumption sorts by expiry, it is used first. Receiving a delivery (**+N** prefills the receive form) creates a new lot with a `receive` movement and records a `stock` sample. Low-stock is the live signal: on-hand below par flags the ingredient, and the `stock` TimeSeries records how many ingredients are low over time.
+A few things worth knowing:
+
+- **The ticket comes first.** The ticket is saved before any ingredients are used. If stock runs short, the dish still completes, because the food has already left the station; the API just returns a warning such as `Not enough Tomato for BURGER-12: short by 1.`
+- **Only known dishes use stock.** Ingredients are only used for the six dishes with a recipe. Any other tag uses nothing.
+- **Expiry is recorded, not enforced.** Nothing throws out expired lots in this draft. An expired lot still counts toward stock, and since the oldest expiry is used first, it's the first to go.
 
 ## Load Simulation
 
