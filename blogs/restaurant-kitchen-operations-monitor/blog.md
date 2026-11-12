@@ -1,15 +1,17 @@
 # Building a Restaurant Kitchen Monitor with GridDB Native and Node.js
 
-A kitchen pass needs to answer two practical questions at once: which stations are free right now, and do we have the ingredients to keep them firing? This tutorial builds a small kitchen operations app with Node.js and GridDB Native. It tracks 12 stations, live tickets, and an ingredient inventory with lots, movements, and low-stock alerts.
+![Restaurant kitchen with glowing order tickets above each station, connected by data lines to a database and a dashboard showing station status and ingredient levels](assets/cover.jpg)
+
+This tutorial builds a small kitchen monitor: a live dashboard that shows which cooking stations are busy and which ingredients are running low. It uses a React dashboard and a Node.js server, and stores orders, stock, and their history in GridDB Cloud through GridDB's native client.
 
 ## Table of Contents
 
 - [Background](#background)
-- [Scope and Features](#scope-and-features)
-- [Client Selection Rationale](#client-selection-rationale)
+- [What You'll Build](#what-youll-build)
+- [Why Use GridDB Native?](#why-use-griddb-native)
+- [System Architecture](#system-architecture)
 - [Requirements](#requirements)
-- [Installation and Startup](#installation-and-startup)
-- [Runtime Design](#runtime-design)
+- [How to Run](#how-to-run)
 - [Data Model](#data-model)
 - [Bridge Internals and API Surface](#bridge-internals-and-api-surface)
 - [Order and Inventory Lifecycles](#order-and-inventory-lifecycles)
@@ -23,56 +25,63 @@ A kitchen pass needs to answer two practical questions at once: which stations a
 
 ## Background
 
-A ticket board alone tells you what was ordered. It does not tell you whether the kitchen can still cook it. This app pairs the familiar fire/complete ticket flow with ingredient lots: every receive creates a lot, every consume or waste decrements one, and on-hand totals are compared against par levels. The dashboard shows both boards side by side, so a low-stock ingredient reads the same way a busy station does.
+Picture a busy dinner service. Orders come in, and the head chef sends each dish to a free station: a burger to the grill, fries to the fryer. A ticket board tracks all of this, but it only tells you what was ordered. It cannot tell you whether the kitchen still has the tomatoes to make the next burger.
 
-## Scope and Features
+This app answers both questions on one screen. When a cook marks a dish as done, the app takes that dish's ingredients out of stock. When a delivery arrives, the stock goes back up. If an ingredient falls below the amount the kitchen likes to keep on hand, it is flagged, just as a busy station is. One look at the dashboard tells you which stations are free and what is running low.
 
-- 12 stations across Grill (G01–G04), Fry (F01–F04), and Pass (P01–P04).
-- Fire and complete tickets with caller-generated UUIDs, so retries are idempotent.
-- Dashboard: a one-line summary, then a live station board with per-ticket timers, an active ticket list, ingredient levels against par, and a receive form.
-- Ingredient inventory: 6 ingredients, receive/consume/waste lots, and low-stock flags.
-- Completing a dish uses its recipe: each dish has a bill of materials, and completion draws those ingredients from the first-expiring lots.
-- History through the API: ticket events, backlog samples, inventory movements, and stock levels.
-- A simulator that generates one kitchen event every 5 seconds, stopped by default.
+## What You'll Build
 
-The application runs in two modes:
+- A live board of 12 kitchen stations, with a timer on each dish that turns amber at 10 minutes and red at 20.
+- An ingredient list that shows stock against its target level and flags anything running low.
+- Completing a dish automatically takes its ingredients out of stock.
+- A simulator that keeps the kitchen busy, so you can watch it work.
+- Two ways to run it: a demo with no database, or live on GridDB Cloud.
 
-- Demo mode keeps tickets and inventory in memory for preview, with no database connection.
-- Native (live) mode persists both to real GridDB containers.
-
-## Client Selection Rationale
+## Why Use GridDB Native?
 
 This tutorial uses the native GridDB client to create containers, write rows, and execute TQL queries against GridDB Cloud. Node.js serves the dashboard and HTTP API, while the Python client performs database operations through JPype and the GridDB Java client.
 
 This is an architectural choice for this project; we haven't established that it is faster or universally better than the Web API.
 
-### How It Works
+## System Architecture
 
-A persistent Python worker connects the two runtimes. It keeps the JVM and database store alive across requests, avoiding the overhead of starting them for every operation.
+Here is how the pieces work together during a shift:
 
-```text
-Browser → Node.js HTTP API → NDJSON over stdin/stdout
-        → persistent Python worker → JPype/JVM
-        → GridDB native connection → GridDB Cloud
-```
+1. **A cook fires a dish.** Kitchen staff open the dashboard in a browser, pick a free station, and send it a dish such as `BURGER-12`.
+2. **The server saves it.** The dashboard sends the action to the Node.js API server, which checks it and hands it to the Python worker. The worker writes the ticket to GridDB Cloud, and the station turns busy.
+3. **The board stays live.** Every 5 seconds the dashboard asks the server for the latest board and stock, so each station's timer and status stay current.
+4. **The dish is done.** When the dish leaves the pass, the cook taps **Done**. The worker closes the ticket and takes the dish's ingredients out of stock.
+5. **A delivery arrives.** Staff record it from the inventory panel, and the worker adds it to stock.
 
-The browser sends HTTP requests. Node.js sends JSON commands to Python, and Python performs database operations using the native GridDB client. These operations do not use the GridDB Cloud Web API. The Notification Provider URL uses HTTPS for discovery.
+Two extras help when you are trying it out: the simulator fires and completes dishes every 5 seconds so the board keeps moving, and demo mode swaps GridDB Cloud for an in-memory store so you can run the app without a database.
 
-The worker handles operations serially. See the official [GridDB Python client](https://github.com/griddb/python_client) and [Cloud public native connection article](https://www.griddb.net/en/blog/connecting-to-griddb-cloud-v3-2-from-your-local-dev-environment-no-vpn-no-vnet-peering/) for the client architecture and route configuration.
+![Kitchen Monitor architecture](assets/architecture.png)
+
+*Figure 1. Kitchen Monitor architecture: React dashboard, Node.js API, Python worker, and GridDB Cloud.*
+
+Under the hood, the dashboard talks to Node.js over plain HTTP and JSON. Node.js never talks to GridDB directly: it writes each operation as one line of JSON (NDJSON) to the Python worker's stdin, tagged with a request ID, and matches the reply that comes back on stdout. The worker uses the GridDB Python client, which calls the GridDB Java client through JPype, so every read and write travels over GridDB's native connection rather than the Web API. The only HTTPS step is discovery: the client looks up the cluster through the Notification Provider URL.
+
+The worker starts once, together with the server, and stays running. It keeps the JVM and the GridDB store open between requests instead of starting them for every operation, and handles one operation at a time.
+
+![Native connection sequence from Node.js through the Python worker, JPype and the Java client to GridDB Cloud](assets/native-connection-sequence.png)
+
+*Figure 2. One native request, step by step: Node.js starts a persistent Python worker once, then sends each query as an NDJSON line. The worker calls GridDB through JPype and the Java client over a native TLS/TCP connection, not the Web API, and replies with `{id, ok, result}`.*
+
+See the official [GridDB Python client](https://github.com/griddb/python_client) and [Cloud public native connection article](https://www.griddb.net/en/blog/connecting-to-griddb-cloud-v3-2-from-your-local-dev-environment-no-vpn-no-vnet-peering/) for the client architecture and route configuration.
 
 ## Requirements
 
 ### Node.js
 
-Install Node.js 22 or newer. The API server uses built-in Node modules for the HTTP server and process bridge. The dashboard is a React application built with Vite, Tailwind CSS, and shadcn-style components; the workspace commands build it before starting the API, which serves the static output from `dashboard/dist`.
+Install [Node.js](https://nodejs.org/en/download) 22 or newer. The API server uses built-in Node modules for the HTTP server and process bridge. The dashboard is a React application built with Vite, Tailwind CSS, and shadcn-style components; the workspace commands build it before starting the API, which serves the static output from `dashboard/dist`.
 
 ### Python
 
-Python 3.12 is recommended. The macOS setup script installs the GridDB Python package, JPype, and PyArrow into the project virtual environment at `apps/native-bridge/.venv/`.
+[Python](https://www.python.org/downloads/) 3.12 is recommended. The macOS setup script installs the GridDB Python package, JPype, and PyArrow into the project virtual environment at `apps/native-bridge/.venv/`.
 
 ### Java and Maven
 
-The GridDB Python client invokes the Java API through JPype. The included macOS setup script uses Homebrew to install OpenJDK 21 and Maven, then builds the Arrow adapter.
+The GridDB Python client invokes the Java API through JPype. The included macOS setup script uses Homebrew to install OpenJDK 21 and Maven, then builds the Arrow adapter. On other systems, install a Java 21 JDK such as [Eclipse Temurin](https://adoptium.net/temurin/releases/?version=21) and [Apache Maven](https://maven.apache.org/download.cgi) yourself.
 
 ### GridDB Cloud
 
@@ -84,191 +93,207 @@ Use a GridDB Cloud service with a supported public native route. From the portal
 
 The setup script supplies the public libraries; it does not download the licensed Cloud JAR. Keep the JAR and real credentials outside a public repository.
 
-## Installation and Startup
+![GridDB Cloud Notification Provider URL location](assets/notification-provider-url.png)
 
-### 1. Preview without GridDB
+*Figure 3. The cluster overview shows the Notification Provider URL for external connections.*
+
+![GridDB Cloud native network access settings](assets/network-access.png)
+
+*Figure 4. Allow your application's public outbound IP under GridDB Access.*
+
+![GridDB Cloud library and plugin download location](assets/griddb-cloud-lib-plugin.png)
+
+*Figure 5. Where to download the GridDB Cloud Java library.*
+
+## How to Run
+
+This part is optional: follow it if you want to try the app yourself. Steps 1 to 6 run it against your own GridDB Cloud. If you only want to look around, clone the repository and jump to the demo at the end of step 6.
+
+### 1. Clone the repository
 
 ```bash
-cd apps
+git clone https://github.com/junwatu/restaurant-kitchen-operations-monitor.git
+cd restaurant-kitchen-operations-monitor/apps
 npm install
-npm run dev:demo
 ```
 
-Open `http://127.0.0.1:3003`. The header says `Demo · memory only`. Demo starts with three busy stations, six seeded ingredient lots (tomato and chicken already below par so the low-stock state is visible), and resets when the server stops.
+The app lives in `apps/`, and every command below runs from there.
 
-To try it, tap a free station, pick a dish (the tag gets a random order number, such as `PASTA-26`), and press **Fire**. The tile shows a running timer that turns amber at 10 minutes and red at 20; press **Done** when the dish leaves. On the inventory side, **+N** next to a low ingredient prefills a delivery that brings it back to par.
+### 2. Install the native dependencies
 
-### 2. Install the native dependencies (macOS)
-
-Run the remaining commands from `apps/`. The setup script needs [Homebrew](https://brew.sh).
+On macOS:
 
 ```bash
 npm run setup:mac
 ```
 
-Then install the Cloud JAR:
+The setup script needs [Homebrew](https://brew.sh). It installs Java and Maven, creates the Python virtual environment, builds the GridDB Python client, and prepares the public runtime JARs. On Linux and Windows, install these manually by following the official client instructions.
+
+### 3. Install the GridDB Cloud JAR
+
+Extract `gridstore-advanced.jar` from the Cloud Java library bundle you downloaded, and copy it to:
+
+```text
+native-bridge/lib/gridstore-advanced.jar
+```
+
+Or pass the Cloud Java library RPM from the bundle to the installer, which extracts the JAR for you:
 
 ```bash
 npm run install:cloud-jar -- "/path/to/griddb-ee-java-lib-5.9.0-linux.x86_64.rpm"
 ```
 
-The script accepts either the Cloud library RPM or an already extracted `gridstore-advanced.jar`. The runtime directory `native-bridge/lib/` should contain `gridstore.jar`, `gridstore-arrow.jar`, `arrow-memory-netty.jar`, and `gridstore-advanced.jar`.
+The runtime directory should now contain these four files:
 
-### 3. Configure environment variables
+```text
+gridstore.jar
+gridstore-arrow.jar
+arrow-memory-netty.jar
+gridstore-advanced.jar
+```
+
+This project loads the Java client, so pick the Cloud Java library bundle, not the Web API or C client package.
+
+### 4. Configure environment variables
+
+Copy the example environment file:
 
 ```bash
 cp native-bridge/.env.example native-bridge/.env
 ```
 
-Fill in your provider URL, cluster, database, user, and password. Use a dedicated database or container prefix (`KITCHEN_CONTAINER_PREFIX`, default `kitchen_demo`). The prefix must start with a letter and contain at most 41 letters, digits, or underscores.
+Fill in your own values:
+
+```dotenv
+GRIDDB_NOTIFICATION_PROVIDER='https://your-provider-url'
+GRIDDB_CLUSTER_NAME='your-cluster'
+GRIDDB_DATABASE='your-database'
+GRIDDB_USERNAME='your-user'
+GRIDDB_PASSWORD='your-password'
+GRIDDB_CONNECTION_ROUTE='PUBLIC'
+GRIDDB_SSL_MODE='PREFERRED'
+GRIDDB_REQUEST_TIMEOUT_MS='30000'
+KITCHEN_CONTAINER_PREFIX='kitchen_demo'
+KITCHEN_API_HOST='127.0.0.1'
+KITCHEN_API_PORT='3003'
+```
+
+The workspace commands load `native-bridge/.env` automatically, and shell environment variables take precedence. Keep the provider URL quoted, do not commit `.env`, and use a dedicated database or container prefix. The prefix must start with a letter and contain at most 41 letters, digits, or underscores.
+
+Now check the local setup:
 
 ```bash
 npm run doctor
+```
+
+`doctor` checks the configuration and local dependencies only. A passing check does not mean GridDB Cloud is reachable yet.
+
+### 5. Initialize the GridDB containers
+
+```bash
 npm run init
+```
+
+This creates the containers: six Collections, two TimeSeries, and one `sensor_` TimeSeries per station (12 in all). Running it again keeps compatible containers, and an incompatible existing schema stops initialization without deleting any data.
+
+Example output, abbreviated:
+
+```text
+[
+  {
+    "name": "kitchen_demo_stations",
+    "status": "created"
+  },
+  {
+    "name": "kitchen_demo_tickets",
+    "status": "created"
+  },
+  {
+    "name": "kitchen_demo_events",
+    "status": "created"
+  },
+  ...
+  {
+    "name": "kitchen_demo_sensor_G01",
+    "status": "created"
+  },
+  ...
+]
+```
+
+If `init` times out, your outbound IP is usually missing from the GridDB Cloud access list. Add it in the portal and retry.
+
+### 6. Seed the kitchen and start the app
+
+Seed the stations and ingredients. This adds anything missing and keeps existing tickets and stock.
+
+```bash
 npm run seed
+```
+
+Check the GridDB connection:
+
+```bash
 npm run dev:griddb
+```
+
+Start the live server. It checks the connection and the seeded stations before it starts listening:
+
+```bash
 npm run dev:live
 ```
 
-`doctor` checks local prerequisites. `init` creates the containers and refuses incompatible schemas without deleting data. `seed` adds missing stations and ingredients without clearing tickets or lots. `dev:griddb` makes one real request to confirm the connection. `dev:live` refuses to start if the database is unreachable or no stations exist.
+Then open this URL in your browser:
 
-If `init` or `dev:griddb` times out, your outbound IP is usually missing from the GridDB Cloud access list. Add it in the portal and retry.
+```text
+http://127.0.0.1:3003
+```
 
-Unlike the demo, a live database starts with no stock: `seed` creates the ingredients but no lots. Before you complete dishes, use **+N** in the inventory panel to receive a delivery for each ingredient. Otherwise each completed dish shows a "not enough" warning.
+The header shows `GridDB Cloud`. A live database starts with no stock: `seed` creates the ingredients but no lots. Before you complete dishes, use **+N** in the inventory panel to receive a delivery for each ingredient; otherwise each completed dish shows a "not enough" warning.
 
-## Runtime Design
+To try it, tap a free station, pick a dish (the tag gets a random order number, such as `PASTA-26`), and press **Fire**. The tile shows a running timer that turns amber at 10 minutes and red at 20; press **Done** when the dish leaves. On the inventory side, **+N** next to a low ingredient prefills a delivery that brings it back to par. Start the simulator from the header when you want extra activity; it is stopped by default.
 
-### Ticket and inventory input
+You can also run the demo version, which needs only step 1:
 
-Manual fires and receives are the basic input. An optional simulator attempts one kitchen transition every five seconds. Per-station busy flags and stock totals are derived from authoritative rows, giving a reproducible data stream without kitchen hardware.
+```bash
+npm run dev:demo
+```
 
-### Node.js application
+The header says `Demo · memory only`. The demo starts with three busy stations and sample stock (tomato and chicken already below par), keeps everything in memory, and resets when the server stops. Stop the live server first, because both use port 3003.
 
-Node.js serves the browser dashboard and the kitchen APIs, validates inputs, starts the worker, matches NDJSON responses to pending requests, and controls the simulator timer. The server exposes named kitchen operations rather than accepting arbitrary TQL or container names from the browser.
+![Kitchen Monitor dashboard in demo mode, with six busy stations, an active ticket list, and ingredient levels against par](assets/dashboard-demo.png)
 
-### Python GridDB worker
-
-One persistent Python process starts the JVM, loads the JARs, and creates the GridDB store. It executes ticket and inventory operations serially, converting native timestamps and serializing results as JSON.
-
-### Kitchen and inventory logic
-
-`python/kitchen.py` checks station availability, fires and completes tickets, receives and consumes lots, computes on-hand totals against par levels, and records event, movement, backlog, and stock projections. Tickets and lots stay authoritative; projections describe their history.
-
-### GridDB Cloud
-
-GridDB stores stations, tickets, ingredients, lots, movements, and history samples. Collections use stable string keys for business records. TimeSeries containers use timestamp keys for recent-window queries.
+*Figure 6. The dashboard in demo mode: the station board on the left, active tickets and ingredient levels on the right. One dish has passed 10 minutes and turned amber, and tomato and chicken are below par.*
 
 ## Data Model
 
 All container names begin with `KITCHEN_CONTAINER_PREFIX` (default `kitchen_demo`).
 
-| Suffix | Type | Purpose |
-| --- | --- | --- |
-| `stations` | Collection | Station metadata (zone, type, enabled) |
-| `tickets` | Collection | Authoritative tickets |
-| `events` | Collection | Fired/completed audit projection |
-| `backlog` | TimeSeries | Busy-station history |
-| `sensor_<id>` | TimeSeries | Per-station busy projection |
-| `ingredients` | Collection | Ingredient metadata, unit, par level |
-| `lots` | Collection | Received lots with qty and expiry |
-| `movements` | Collection | Receive/consume/waste audit projection |
-| `stock` | TimeSeries | Total qty on hand and low-ingredient count |
+![Kitchen Monitor data model](assets/data-model.png)
 
-### `stations` Collection
+*Figure 7. Kitchen Monitor data model: nine container types grouped as inventory, kitchen, and time series. References between containers are kept by the app; GridDB does not enforce them.*
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `station_id` | STRING, row key | `G01`–`G04`, `F01`–`F04`, `P01`–`P04` |
-| `zone` | STRING | `Grill`, `Fry`, or `Pass` |
-| `station_type` | STRING | Lowercase zone name |
-| `enabled` | BOOL | Disabled stations cannot take tickets |
+The containers fall into three groups:
 
-### `tickets` Collection
+**Inventory**
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `ticket_id` | STRING, row key | Caller-generated UUID |
-| `station_id` | STRING | Station reference |
-| `dish_tag` | STRING | 1–16 uppercase letters, digits, spaces, or hyphens |
-| `fired_at` | TIMESTAMP | Fire time in UTC |
-| `completed_at` | TIMESTAMP | Equal to `fired_at` until the ticket is completed |
-| `active` | BOOL | True until completed |
-| `simulated` | BOOL | Whether the simulator created the ticket |
+- `ingredients`: the six ingredients the kitchen tracks, each with its unit and par level. The dashboard compares on-hand stock against par to flag low items.
+- `lots`: one row per delivery, with the remaining quantity and expiry date. On-hand stock is the sum of active lots, and recipes draw from the earliest-expiring lot first.
+- `movements`: the audit trail of every receive, consume, and waste, one row per lot touched. Its predictable IDs also make retries safe.
 
-### `events` Collection
+**Kitchen**
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `event_id` | STRING, row key | `<ticketId>_fired` or `<ticketId>_completed` |
-| `timestamp` | TIMESTAMP | Event time in UTC |
-| `event_type` | STRING | `fired` or `completed` |
-| `station_id` | STRING | Station reference |
-| `ticket_id` | STRING | Ticket reference |
-| `dish_tag` | STRING | Copied from the ticket |
+- `stations`: the 12 stations across the Grill, Fry, and Pass zones. A disabled station cannot take tickets.
+- `tickets`: the source of truth for orders, one active ticket per station. It drives the station board and the completed-today count.
+- `events`: a log of every fired and completed ticket, read by `/api/events` for recent activity.
 
-### `backlog` TimeSeries
+**Time series**
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `timestamp` | TIMESTAMP, row key | Sample time in UTC |
-| `busy` | INTEGER | Active tickets (busy stations) |
-| `capacity` | INTEGER | Enabled stations |
+- `backlog`: busy stations against capacity, sampled on every fire and complete. `/api/history` reads it for load over time.
+- `sensor_<stationId>`: one container per station, recording whether it was busy and with which ticket at each sample. The app writes these for per-station history but does not read them yet.
+- `stock`: total on-hand quantity and the number of low ingredients after every inventory change. `/api/stock-history` reads it for stock over time.
 
-### `sensor_<stationId>` TimeSeries
-
-One container per station, written with every backlog sample.
-
-| Column | Type | Description |
-| --- | --- | --- |
-| `timestamp` | TIMESTAMP, row key | Sample time in UTC |
-| `busy` | BOOL | Whether the station has an active ticket |
-| `ticket_id` | STRING | Active ticket, or empty when free |
-| `source` | STRING | Always `ticket_projection` in this app |
-
-### `ingredients` Collection
-
-| Column | Type | Description |
-| --- | --- | --- |
-| `ingredient_id` | STRING, row key | e.g. `TOMATO`, `CHEESE` |
-| `name` | STRING | Display name |
-| `unit` | STRING | `kg`, `g`, or `L` |
-| `par_level` | INTEGER | Reorder threshold in the same unit |
-| `enabled` | BOOL | Whether the ingredient accepts receives |
-
-Seeded with six ingredients: tomato, cheese, flour, chicken, basil, oil.
-
-### `lots` Collection
-
-| Column | Type | Description |
-| --- | --- | --- |
-| `lot_id` | STRING, row key | UUID for one delivery |
-| `ingredient_id` | STRING | Ingredient reference |
-| `qty` | INTEGER | Remaining quantity; decremented by consume/waste |
-| `received_at` | TIMESTAMP | Receive time in UTC |
-| `expires_at` | TIMESTAMP | Receive time plus `expiresInDays` (default 7) |
-| `active` | BOOL | False once the lot hits zero |
-| `simulated` | BOOL | Whether the simulator created the lot |
-
-UUID keys let distinct deliveries share a timestamp. A lot at zero stays for audit and retry handling.
-
-### `movements` Collection
-
-| Column | Type | Description |
-| --- | --- | --- |
-| `movement_id` | STRING, row key | `<lotId>_receive` for receives; the caller's `consumeId` UUID for consume/waste |
-| `timestamp` | TIMESTAMP | Movement time in UTC |
-| `movement_type` | STRING | `receive`, `consume`, or `waste` |
-| `ingredient_id` | STRING | Ingredient reference |
-| `lot_id` | STRING | Lot reference |
-| `qty` | INTEGER | Moved quantity |
-
-### `stock` TimeSeries
-
-| Column | Type | Description |
-| --- | --- | --- |
-| `timestamp` | TIMESTAMP, row key | Sample time in UTC |
-| `total_qty` | INTEGER | Sum of on-hand qty across active lots |
-| `low_count` | INTEGER | Ingredients below par |
+[Full column reference](https://github.com/junwatu/restaurant-kitchen-operations-monitor/blob/main/docs/data-model.md): every column, its type, and what it holds.
 
 ## Bridge Internals and API Surface
 
@@ -294,32 +319,89 @@ The browser talks to `src/server.js`, which uses Node's built-in `node:http` mod
 
 POST routes require `Content-Type: application/json`. Firing a ticket, receiving a lot, or recording a consume/waste returns 201 the first time and 200 for a matching retry. Completing a ticket returns 200. Invalid input returns 400, unknown tickets/lots return 404, conflicts return 409 (busy station, reused ID with a different payload, empty lot, not enough stock), and native failures return 503.
 
-### Same CRUD, different domain
+### CRUD with the native client
 
-Every GridDB access still goes through three primitives in `python/kitchen.py`: `put` (create/update upsert), `get` (single row by key), and `read` (TQL via `container.query(tql).fetch()`). The inventory operations reuse them exactly:
+All database work happens in the Python worker, through the GridDB Python client running on the Java client. The snippets below are trimmed from `python/init_schema.py` and `python/kitchen.py`.
 
-- `receive` puts a `lots` row, then projects a `movements` row and a `stock` sample — the same write-plus-projection shape as firing a ticket.
-- `consume` first looks up its `consumeId` movement (a retry), then reads the lot back, decrements `qty`, deactivates at zero, and writes the movement — the same read-modify-write shape as completing a ticket.
-- `complete` marks the ticket done, then runs `consume_for_ticket`: it looks up the dish's recipe by tag prefix (`BURGER-12` → `BURGER`), reads active lots sorted by `expires_at`, decrements them first-expiring first, and writes one `consume` movement per lot it draws from, keyed `<ticketId>_<ingredientId>_<lotId>`.
-- `inventory` sums active lots per ingredient and compares against par — the same derive-state-from-authoritative-rows shape as the station board.
+**Create a container.** `npm run init` defines each container once. A row key makes the first column the primary key, and a TimeSeries uses its timestamp as the key:
 
-Lots and tickets remain the authority. If a movement or history write fails, the API returns the saved row plus a warning.
+```python
+import griddb_python as griddb
 
-### Idempotent retries
+LOTS = (("lot_id", "STRING"), ("ingredient_id", "STRING"), ("qty", "INTEGER"),
+        ("received_at", "TIMESTAMP"), ("expires_at", "TIMESTAMP"),
+        ("active", "BOOL"), ("simulated", "BOOL"))
 
-Every write that creates something takes a caller-generated UUID: `ticketId` for fire, `lotId` for receive, and `consumeId` for consume/waste. Retrying with the same ID and payload returns the saved row with `replayed: true`; the same ID with a different payload returns 409. Completing an already completed ticket also replays, and the replay returns before ingredient consumption, so a dish never uses its ingredients twice.
+info = griddb.ContainerInfo(
+    "kitchen_demo_lots",
+    [[name, getattr(griddb.Type, kind)] for name, kind in LOTS],
+    type=griddb.ContainerType.COLLECTION,
+    row_key=True,
+)
+store.put_container(info, modifiable=False)
+```
 
-After an uncertain response (for example a native timeout), retry with the same UUID instead of minting a new one. The dashboard does this for fire and receive by keeping the pending request until it succeeds.
+**Create a row.** `put` writes a row as a list, in column order. Receiving a delivery saves the lot, then its `receive` movement:
 
-A receive retry is checked against the original `receive` movement, not the lot's current `qty`, because the lot may already have been partly consumed. For consume, the movement row keyed by `consumeId` is the retry record. If the lot write succeeds but the movement write fails, the API returns a warning; don't retry that `consumeId`, reconcile from lots instead.
+```python
+con = store.get_container("kitchen_demo_lots")
+con.put([lot_id, "TOMATO", 25, now, now + timedelta(days=7), True, False])
+con.close()
+
+movements = store.get_container("kitchen_demo_movements")
+movements.put([f"{lot_id}_receive", now, "receive", "TOMATO", lot_id, 25])
+movements.close()
+```
+
+**Read rows.** `get` fetches one row by key. `query` runs TQL and returns a row set:
+
+```python
+lot = con.get(lot_id)  # None if the key doesn't exist
+
+rs = con.query("SELECT * WHERE active LIMIT 1001").fetch()
+rows = []
+while rs.has_next():
+    rows.append(rs.next())
+rs.close()
+```
+
+**Update a row.** `put` on an existing key replaces the row, so an update is read, change, put. Using 5 kg from a lot looks like this:
+
+```python
+lot = con.get(lot_id)
+lot[2] -= 5             # qty
+if lot[2] == 0:
+    lot[5] = False      # active
+con.put(lot)
+```
+
+**Delete.** The app never deletes rows. A finished ticket or an empty lot is marked `active = False` instead, so it stays in the audit trail and out of the live board. If you do need a hard delete, the client has `con.remove(key)`.
+
+In the app these calls sit behind three small helpers in `python/kitchen.py`: `put`, `get`, and `read` (a TQL query). Each one opens the container, runs the call, and closes it.
+
+### What happens if a request is sent twice?
+
+The requests here are the `POST` calls that change data: firing a dish (`/api/tickets/fire`), receiving a delivery (`/api/inventory/receive`), and recording use or waste (`/api/inventory/consume`). For example, a cook taps **Fire**, the server saves the ticket in GridDB, but the reply never reaches the browser because of a network blip or timeout. The dashboard can't tell whether it worked, so it sends the same request again.
+
+To keep that from creating a second ticket or counting a delivery twice, the caller picks the ID before sending: `ticketId` for fire, `lotId` for receive, and `consumeId` for use or waste. A retry reuses the same ID, and the dashboard does this for fire and receive. This makes the requests idempotent: sending one twice has the same effect as sending it once.
+
+- **New ID:** the row is saved (201).
+- **Same ID and same details:** nothing new is saved, and the existing row comes back with `replayed: true` (200).
+- **Same ID, different details:** the request is rejected (409).
+
+Completing a dish works the same way: if the ticket is already done, the server returns it without using the ingredients again.
 
 ## Order and Inventory Lifecycles
 
+![How the Kitchen Monitor works](assets/how-it-works.png)
+
+*Figure 8. How the Kitchen Monitor works: a dish from fire to restock, and what each step writes to GridDB.*
+
 The ticket lifecycle is simple: `active` distinguishes fired from completed tickets. `completed_at` is written equal to `fired_at` when a ticket is fired and overwritten on completion; the API reports `completedAt: null` while a ticket is active. Completed tickets stay queryable for the daily count.
 
-Completion links the two lifecycles. The ticket is saved first because it is authoritative; ingredient use follows as a best-effort step like the other projections. If stock runs short, the dish still completes and the API returns a warning such as `Not enough Tomato for BURGER-12: short by 1.`, because the food has already left the station. Dishes without a recipe (any tag whose prefix is not one of the six dishes) consume nothing.
+Completion links the two lifecycles. The ticket is saved first because it is authoritative; ingredient use follows as a best-effort step like the other projections. It takes each recipe ingredient from the earliest-expiring active lots, writes one `consume` movement per lot it draws from, marks a lot inactive when it reaches zero, and records a `stock` sample. If stock runs short, the dish still completes and the API returns a warning such as `Not enough Tomato for BURGER-12: short by 1.`, because the food has already left the station. Dishes without a recipe (any tag whose prefix is not one of the six dishes) consume nothing.
 
-Inventory adds expiry without enforcement: `expires_at` is recorded from `expiresInDays` but nothing auto-wastes expired lots in this draft. Low-stock is the live signal: on-hand below par flags the ingredient, and the `stock` TimeSeries records how many ingredients are low over time.
+Inventory adds expiry without enforcement: `expires_at` is recorded from `expiresInDays` but nothing auto-wastes expired lots in this draft. An expired lot still counts toward on-hand, and because consumption sorts by expiry, it is used first. Receiving a delivery (**+N** prefills the receive form) creates a new lot with a `receive` movement and records a `stock` sample. Low-stock is the live signal: on-hand below par flags the ingredient, and the `stock` TimeSeries records how many ingredients are low over time.
 
 ## Load Simulation
 
@@ -370,8 +452,9 @@ The `LIMIT 1001` reads are deliberate. Fetching one row past the expected maximu
 
 ## Verification
 
+From `apps/`:
+
 ```bash
-cd apps
 npm run check
 npm test
 ```

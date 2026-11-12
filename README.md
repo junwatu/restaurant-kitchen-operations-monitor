@@ -122,10 +122,12 @@ All names start with `KITCHEN_CONTAINER_PREFIX`.
 | `sensor_G01` … | TimeSeries | Timestamp | Per-station busy state, ticket ID, source |
 | `ingredients` | Collection | `ingredient_id` | Name, unit, par level, enabled state |
 | `lots` | Collection | UUID `lot_id` | Ingredient, qty, received/expiry timestamps, active state |
-| `movements` | Collection | `<lotId>_receive` or `consumeId` | Receive/consume/waste audit projection; also the consume retry record |
+| `movements` | Collection | `<lotId>_receive`, `<ticketId>_<ingredientId>_<lotId>`, or `consumeId` | Receive/consume/waste audit projection; also the consume retry record |
 | `stock` | TimeSeries | Timestamp | Total qty on hand and low-ingredient count |
 
 Tickets and lots are authoritative. Event, backlog, sensor, movement, and stock projections are best-effort; on projection failure the API returns the saved row plus a warning.
+
+Every column, with its type and meaning: [docs/data-model.md](docs/data-model.md).
 
 ## API reference
 
