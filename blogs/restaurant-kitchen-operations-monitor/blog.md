@@ -319,6 +319,78 @@ The browser talks to `src/server.js`, which uses Node's built-in `node:http` mod
 
 POST routes require `Content-Type: application/json`. Firing a ticket, receiving a lot, or recording a consume/waste returns 201 the first time and 200 for a matching retry. Completing a ticket returns 200. Invalid input returns 400, unknown tickets/lots return 404, conflicts return 409 (busy station, reused ID with a different payload, empty lot, not enough stock), and native failures return 503.
 
+### How the server handles a request
+
+A request passes through three layers in `src/`: `server.js` routes it, `kitchen-service.js` checks the input, and `griddb-client.js` sends it to the Python worker. The snippets below are trimmed from those files.
+
+**1. Route the request.** The server is plain `node:http`. Each route calls one service method. A creating write returns 201 the first time and 200 for a retry, and the error name sent back by the worker becomes the HTTP status:
+
+```js
+const statuses = { ValueError: 400, ConflictError: 409, LookupError: 404 };
+
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, origin);
+    let result;
+    let status = 200;
+    if (req.method === 'GET' && url.pathname === '/api/kitchen') result = await service.snapshot();
+    else if (req.method === 'POST' && url.pathname === '/api/tickets/fire') {
+      result = await service.fire(await body(req));
+      status = result.replayed ? 200 : 201;
+    }
+    // ...the other routes
+    else { json(res, 404, { error: 'Endpoint not found' }); return; }
+    json(res, status, result);
+  } catch (error) {
+    json(res, error.status || statuses[error.name] || 503, { error: error.message });
+  }
+});
+```
+
+**2. Check the input.** `KitchenService` rejects bad input before anything reaches GridDB, then passes a clean payload to the worker:
+
+```js
+export function firePayload(body) {
+  const dishTag = typeof body.dishTag === 'string' ? body.dishTag.trim().toUpperCase() : '';
+  if (!UUID_RE.test(body.ticketId)) invalid('Provide a UUID ticketId so retries are idempotent');
+  if (!STATION_RE.test(body.stationId)) invalid('Invalid kitchen station');
+  if (!/^[A-Z0-9 -]{1,16}$/.test(dishTag)) invalid('Dish tag must contain 1–16 letters, digits, spaces or hyphens');
+  return { ticketId: body.ticketId.toLowerCase(), stationId: body.stationId, dishTag };
+}
+
+async fire(body) { return this.store.request('fire', firePayload(body)); }
+```
+
+**3. Send it to the worker.** `GridDBClient.request` writes one JSON line to the worker's stdin with a numbered `id` and keeps the promise in a pending map. When the worker prints its reply line, the client finds the promise by `id` and settles it. If no reply arrives in time (30 seconds by default), the client stops the worker, because the write may or may not have happened:
+
+```js
+request(operation, payload = {}) {
+  const id = this.#nextId++;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      this.#failAll(new Error(`GridDB operation ${operation} timed out; the write outcome may be unknown.`));
+      this.#child.kill('SIGKILL');
+    }, this.#timeoutMs);
+    this.#pending.set(id, { resolve, reject, timer });
+    this.#child.stdin.write(`${JSON.stringify({ ...payload, id, operation })}\n`);
+  });
+}
+
+#handleLine(line) {
+  const message = JSON.parse(line);
+  const pending = this.#pending.get(message.id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  this.#pending.delete(message.id);
+  if (message.ok) return pending.resolve(message.result);
+  const error = new Error(message.error.message);
+  error.name = message.error.type;   // ValueError, ConflictError, LookupError...
+  pending.reject(error);
+}
+```
+
+In demo mode the server gets a `DemoStore` instead of a `GridDBClient`. It has the same `request(operation, payload)` method, so the routes and the service don't change.
+
 ### CRUD with the native client
 
 All database work happens in the Python worker, through the GridDB Python client running on the Java client. The snippets below are trimmed from `python/init_schema.py` and `python/kitchen.py`.

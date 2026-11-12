@@ -12,3 +12,6 @@ apps/dashboard/dist/
 # Native GridDB runtime built by npm run setup:mac (the Cloud jar is licensed; never commit it)
 apps/native-bridge/lib/*.jar
 apps/native-bridge/.build/
+
+# Archify diagram working files
+.archify/
