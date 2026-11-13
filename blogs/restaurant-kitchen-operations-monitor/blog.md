@@ -14,6 +14,7 @@ This tutorial builds a small kitchen monitor: a live dashboard that shows which 
 - [How to Run](#how-to-run)
 - [Data Model](#data-model)
 - [Bridge Internals and API Surface](#bridge-internals-and-api-surface)
+- [Monitoring the Stations](#monitoring-the-stations)
 - [Order and Inventory Lifecycles](#order-and-inventory-lifecycles)
 - [Load Simulation](#load-simulation)
 - [Query Patterns and Examples](#query-patterns-and-examples)
@@ -520,6 +521,68 @@ To keep that from creating a second ticket or counting a delivery twice, the cal
 
 Completing a dish works the same way: if the ticket is already done, the server returns it without using the ingredients again.
 
+## Monitoring the Stations
+
+There is no separate monitoring service. A station is busy if it has an active ticket and free if it doesn't, so the board is worked out from the `tickets` container every time the dashboard asks for it. Three pieces of code do the work.
+
+**1. The worker builds the board.** `snapshot()` in `python/kitchen.py` reads the stations and the active tickets from GridDB, pins each ticket to its station, and counts the totals:
+
+```python
+def snapshot(self):
+    metadata = self.read("stations", "SELECT * ORDER BY station_id ASC LIMIT 65")
+    active = self.read("tickets", "SELECT * WHERE active LIMIT 1001")
+    by_station = {row[1]: ticket_json(row) for row in active}   # station_id -> ticket
+    stations = [{"id": r[0], "zone": r[1], "type": r[2], "enabled": r[3],
+                 "ticket": by_station.get(r[0])} for r in metadata]
+    capacity = sum(1 for station in stations if station["enabled"])
+    stats = {"capacity": capacity, "busy": len(active), "free": capacity - len(active)}
+    return {"stations": stations, "tickets": [ticket_json(row) for row in active], "stats": stats}
+```
+
+The real function also counts the dishes completed today and stops with an error if two active tickets point at the same station, so the board never shows a wrong state.
+
+**2. The dashboard polls every 5 seconds.** `App.jsx` fetches the board and the inventory together, then a second timer ticks once a second so the timers keep moving between polls:
+
+```js
+const POLL_MS = 5000;
+
+const refresh = async () => {
+  const [k, inv] = await Promise.all([api('/api/kitchen'), api('/api/inventory')]);
+  setKitchen(k);
+  setInventory(inv);
+};
+
+useEffect(() => {
+  refresh();
+  const id = setInterval(refresh, POLL_MS);
+  return () => clearInterval(id);
+}, []);
+
+useEffect(() => {
+  const id = setInterval(() => setNow(Date.now()), 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+**3. Each tile colours itself by age.** `lib/kitchen.js` turns the time since `firedAt` into a level, and `StationBoard.jsx` picks the tile colour from it:
+
+```js
+export const WARN_MIN = 10;
+export const LATE_MIN = 20;
+
+export function urgency(ms) {
+  const min = ms / 60000;
+  if (min >= LATE_MIN) return 'late';   // red
+  if (min >= WARN_MIN) return 'warn';   // amber
+  return 'ok';                          // green
+}
+
+// In each busy tile:
+const level = urgency(now - new Date(station.ticket.firedAt).getTime());
+```
+
+Because the timer is computed in the browser from `firedAt`, the server never has to push updates: a dish turns amber at exactly 10 minutes even between polls. Every fire and complete also saves the state over time: a `backlog` sample (busy stations against capacity, read by `/api/history`) and a `sensor_<stationId>` sample for each station (written, but not read by the app yet).
+
 ## Order and Inventory Lifecycles
 
 ![How the Kitchen Monitor works](assets/how-it-works.png)
@@ -569,33 +632,92 @@ Because every simulated dish uses ingredients, stock keeps falling while the sim
 
 ## Query Patterns and Examples
 
-A stock-history request shows the full path. An API client calls `GET /api/stock-history?hours=24`; `KitchenService.stockHistory` validates the window and sends `{operation: "stock_history", hours}` to the worker; `kitchen.stock_history` runs the TQL query against the `stock` TimeSeries and returns `{points, limit, possiblyTruncated}`.
+You can drive the whole app from the command line. Every dashboard action is a plain HTTP call to the Node.js server on port 3003, and every read ends in a fixed TQL query in the Python worker.
 
-```bash
-curl 'http://127.0.0.1:3003/api/inventory'
-curl 'http://127.0.0.1:3003/api/stock-history?hours=24'
-curl -X POST http://127.0.0.1:3003/api/inventory/receive \
-  -H 'Content-Type: application/json' \
-  -d '{"lotId":"7b5207cb-92ab-491e-b410-132535258ba1","ingredientId":"TOMATO","qty":25}'
-curl -X POST http://127.0.0.1:3003/api/inventory/consume \
-  -H 'Content-Type: application/json' \
-  -d '{"consumeId":"8b5207cb-92ab-491e-b410-132535258ba1","lotId":"7b5207cb-92ab-491e-b410-132535258ba1","qty":5}'
-```
+### Following one request end to end
+
+Here is what happens when you ask for the last 24 hours of stock levels:
+
+1. **The client calls the API:** `GET /api/stock-history?hours=24`.
+2. **Node.js checks the input:** `KitchenService.stockHistory` makes sure `hours` is a whole number from 1 to 168, and returns 400 if it isn't.
+3. **Node.js hands it to the worker:** it writes `{"operation":"stock_history","hours":24,"id":…}` as one line to the worker's stdin.
+4. **The worker runs TQL:** `stock_history` in `kitchen.py` queries the `stock` TimeSeries for rows newer than 24 hours ago, newest first, up to 1,000 rows.
+5. **The worker replies:** it flips the rows into oldest-first order and returns `{points, limit, possiblyTruncated}`, which Node.js sends back as JSON.
+
+### Trying the API
+
+Start the app (live or demo), then run these from another terminal. The IDs are example UUIDs; use your own for new writes.
+
+1. **See the station board.** Returns every station with its active ticket (or `null`), the active ticket list, the counts, and the simulator status:
+
+   ```bash
+   curl 'http://127.0.0.1:3003/api/kitchen'
+   ```
+
+2. **Check stock against par.** Returns each ingredient with its on-hand amount and a `low` flag:
+
+   ```bash
+   curl 'http://127.0.0.1:3003/api/inventory'
+   ```
+
+   ```json
+   {"items":[{"id":"TOMATO","name":"Tomato","unit":"kg","parLevel":20,"enabled":true,"onHand":12,"low":true}, …],"lowCount":2,"generatedAt":"…"}
+   ```
+
+3. **Receive a delivery.** Creates a lot of 25 kg of tomato that expires in 7 days (the default). Returns 201 with the new lot, or 200 with `replayed: true` if you send the same `lotId` again:
+
+   ```bash
+   curl -X POST http://127.0.0.1:3003/api/inventory/receive \
+     -H 'Content-Type: application/json' \
+     -d '{"lotId":"7b5207cb-92ab-491e-b410-132535258ba1","ingredientId":"TOMATO","qty":25}'
+   ```
+
+4. **Record waste from that lot.** Takes 5 kg out of the lot and logs it as waste. Leave out `kind` to record normal use instead. A larger `qty` than the lot holds returns 409:
+
+   ```bash
+   curl -X POST http://127.0.0.1:3003/api/inventory/consume \
+     -H 'Content-Type: application/json' \
+     -d '{"consumeId":"8b5207cb-92ab-491e-b410-132535258ba1","lotId":"7b5207cb-92ab-491e-b410-132535258ba1","qty":5,"kind":"waste"}'
+   ```
+
+5. **See the audit trail.** Returns the newest 100 movements, so you can see the receive and the waste you just made:
+
+   ```bash
+   curl 'http://127.0.0.1:3003/api/movements'
+   ```
+
+6. **Read the history.** Returns time-series points, oldest first. `hours` can be 1 to 168:
+
+   ```bash
+   curl 'http://127.0.0.1:3003/api/stock-history?hours=24'
+   curl 'http://127.0.0.1:3003/api/history?hours=24'
+   ```
+
+   ```json
+   {"points":[{"timestamp":"…","totalQty":513,"lowCount":2}, …],"limit":1000,"possiblyTruncated":false}
+   ```
 
 ### TQL used by the worker
 
-All reads go through `container.query(tql).fetch()` in `python/kitchen.py`. The browser never sends TQL. Each query is fixed in the worker, and only validated integers (like `hours`) or server-computed timestamps are put into it.
+All reads go through `container.query(tql).fetch()` in `python/kitchen.py`. The browser never sends TQL: each query is written into the worker, and the only values put into it are a validated whole number (`hours`) or a timestamp the server works out itself.
 
-| Purpose | Container | TQL |
-| --- | --- | --- |
-| Active tickets | `tickets` | `SELECT * WHERE active LIMIT 1001` |
-| Completed today | `tickets` | `SELECT * WHERE NOT active AND completed_at >= TIMESTAMP('<UTC midnight>') LIMIT 5001` |
-| Backlog window | `backlog` | `SELECT * WHERE timestamp > TIMESTAMPADD(HOUR, NOW(), -24) ORDER BY timestamp DESC LIMIT 1000` |
-| Stock window | `stock` | `SELECT * WHERE timestamp > TIMESTAMPADD(HOUR, NOW(), -24) ORDER BY timestamp DESC LIMIT 1000` |
-| Active lots | `lots` | `SELECT * WHERE active LIMIT 1001` |
-| Recent movements | `movements` | `SELECT * ORDER BY timestamp DESC LIMIT 100` |
+| Purpose | Container | TQL | Used for |
+| --- | --- | --- | --- |
+| Active tickets | `tickets` | `SELECT * WHERE active LIMIT 1001` | The station board |
+| Completed today | `tickets` | `SELECT * WHERE NOT active AND completed_at >= TIMESTAMP('<UTC midnight>') LIMIT 5001` | The "completed today" count |
+| Stations | `stations` | `SELECT * ORDER BY station_id ASC LIMIT 65` | The 12 tiles, in order |
+| Active lots | `lots` | `SELECT * WHERE active LIMIT 1001` | On-hand stock per ingredient |
+| Ingredients | `ingredients` | `SELECT * ORDER BY ingredient_id ASC LIMIT 65` | The ingredient list with par levels |
+| Recent events | `events` | `SELECT * ORDER BY timestamp DESC LIMIT 100` | `/api/events` |
+| Recent movements | `movements` | `SELECT * ORDER BY timestamp DESC LIMIT 100` | `/api/movements` |
+| Backlog window | `backlog` (TimeSeries) | `SELECT * WHERE timestamp > TIMESTAMPADD(HOUR, NOW(), -24) ORDER BY timestamp DESC LIMIT 1000` | `/api/history` |
+| Stock window | `stock` (TimeSeries) | `SELECT * WHERE timestamp > TIMESTAMPADD(HOUR, NOW(), -24) ORDER BY timestamp DESC LIMIT 1000` | `/api/stock-history` |
 
-The `LIMIT 1001` reads are deliberate. Fetching one row past the expected maximum lets the worker detect overflow and fail loudly, instead of silently showing a partial board or under-counting stock. Time windows run against TimeSeries containers keyed by timestamp. Business records with stable IDs live in Collections, so retries and updates can fetch them directly with `get(key)`.
+A few patterns are worth noticing:
+
+- **One row past the limit.** Queries that must be complete (`LIMIT 1001`, `LIMIT 5001`) fetch one row more than the app expects. If that extra row comes back, the worker fails loudly instead of quietly showing a partial board or under-counting stock.
+- **Time windows on TimeSeries.** History lives in containers keyed by timestamp, so `TIMESTAMPADD(HOUR, NOW(), -24)` picks a window directly. The results are capped at 1,000 points, and `possiblyTruncated` tells you when you hit the cap.
+- **Keys instead of queries.** Records with stable IDs (tickets, lots, movements) live in Collections, so retries and updates fetch them with `get(key)` and need no TQL at all.
 
 ## Production Integration
 
