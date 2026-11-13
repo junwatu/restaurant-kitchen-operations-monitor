@@ -17,10 +17,9 @@ This tutorial builds a small kitchen monitor: a live dashboard that shows which 
 - [Order and Inventory Lifecycles](#order-and-inventory-lifecycles)
 - [Load Simulation](#load-simulation)
 - [Query Patterns and Examples](#query-patterns-and-examples)
-- [Verification](#verification)
 - [Production Integration](#production-integration)
 - [Future Work](#future-work)
-- [Summary](#summary)
+- [Conclusion](#conclusion)
 - [Related Documentation](#related-documentation)
 
 ## Background
@@ -39,9 +38,15 @@ This app answers both questions on one screen. When a cook marks a dish as done,
 
 ## Why Use GridDB Native?
 
-This tutorial uses the native GridDB client to create containers, write rows, and execute TQL queries against GridDB Cloud. Node.js serves the dashboard and HTTP API, while the Python client performs database operations through JPype and the GridDB Java client.
+GridDB Cloud also offers a Web API over HTTPS, but some environments don't allow database operations through an HTTP API. Since GridDB Cloud v3.2, native Java and Python clients can connect over the public internet with `connectionRoute=PUBLIC`, so you no longer need a VPN or VNet peering to use them from your own machine.
 
-This is an architectural choice for this project; we haven't established that it is faster or universally better than the Web API.
+The native client also fits this app well:
+
+- **Direct row access.** `get(key)` fetches a ticket or lot by its ID, and `put(row)` saves it, with no SQL or JSON mapping in between.
+- **TimeSeries containers.** Backlog and stock history go into containers keyed by timestamp, and TQL time-window queries such as `TIMESTAMPADD(HOUR, NOW(), -24)` read them back.
+- **One long-lived connection.** A single worker opens the store once and reuses it for every request.
+
+The current GridDB Python client is built on the GridDB Java client through JPype, so this app uses it from a small Python worker. Node.js serves the dashboard and the HTTP API and hands every database call to that worker.
 
 ## System Architecture
 
@@ -389,7 +394,59 @@ request(operation, payload = {}) {
 }
 ```
 
+Here is what actually crosses the pipe when a cook fires `BURGER-12` at station G01. Node.js writes one line:
+
+```json
+{"ticketId":"5b5207cb-92ab-491e-b410-132535258ba1","stationId":"G01","dishTag":"BURGER-12","id":7,"operation":"fire"}
+```
+
+The worker saves the ticket and prints one line back with the same `id`:
+
+```json
+{"id":7,"ok":true,"result":{"ticket":{"id":"5b5207cb-92ab-491e-b410-132535258ba1","stationId":"G01","dishTag":"BURGER-12","firedAt":"2026-11-13T18:42:05.123Z","completedAt":null,"active":true,"simulated":false},"replayed":false,"warnings":[]}}
+```
+
+If the station is already busy, the reply carries the error instead, and the server turns `ConflictError` into a 409:
+
+```json
+{"id":7,"ok":false,"error":{"type":"ConflictError","message":"Station is already busy"}}
+```
+
 In demo mode the server gets a `DemoStore` instead of a `GridDBClient`. It has the same `request(operation, payload)` method, so the routes and the service don't change.
+
+### Connecting to GridDB Cloud
+
+When the worker starts, it loads the GridDB Java client into a JVM and opens the store. This is trimmed from `start_gridstore()` in `python/griddb_worker.py`:
+
+```python
+import os
+from pathlib import Path
+import jpype
+
+lib = Path(__file__).resolve().parents[1] / "lib"
+if not jpype.isJVMStarted():
+    jpype.startJVM(classpath=[str(path) for path in sorted(lib.glob("*.jar"))])
+
+import griddb_python as griddb  # import after the JVM is running
+
+store = griddb.StoreFactory.get_instance().get_store(
+    notification_provider=os.environ["GRIDDB_NOTIFICATION_PROVIDER"],
+    cluster_name=os.environ["GRIDDB_CLUSTER_NAME"],
+    database=os.environ["GRIDDB_DATABASE"],
+    username=os.environ["GRIDDB_USERNAME"],
+    password=os.environ["GRIDDB_PASSWORD"],
+    ssl_mode=os.environ.get("GRIDDB_SSL_MODE", "PREFERRED"),
+    connection_route="PUBLIC",
+)
+```
+
+A few details matter here:
+
+- **The four JARs.** `lib/` holds `gridstore.jar`, `gridstore-arrow.jar`, `arrow-memory-netty.jar`, and `gridstore-advanced.jar`. The last one comes from the GridDB Cloud download (step 3 of How to Run) and is needed for the Cloud's SSL connection. The worker refuses to start if any of them is missing.
+- **`PUBLIC` must be uppercase.** It tells the client to use the public route. The app reads it from `GRIDDB_CONNECTION_ROUTE`; for private access over Azure VNet peering you leave it empty.
+- **The connection is lazy.** `get_store` doesn't contact the cluster. The first container call does, which is why `npm run dev:griddb` makes one real request to prove the connection works.
+
+The worker keeps this `store` for its whole life and closes it on shutdown.
 
 ### CRUD with the native client
 
@@ -484,13 +541,7 @@ A few things worth knowing:
 - **Only known dishes use stock.** Ingredients are only used for the six dishes with a recipe. Any other tag uses nothing.
 - **Expiry is recorded, not enforced.** Nothing throws out expired lots in this draft. An expired lot still counts toward stock, and since the oldest expiry is used first, it's the first to go.
 
-## Load Simulation
-
-The simulator (stopped by default) attempts one transition every 5 seconds. Each tick it either completes a random simulated ticket (always when every station is busy, otherwise with 45% probability) or fires a new simulated ticket at a random free station. Manually fired tickets are never completed by the simulator. Starting it in native mode writes real sample data under the configured prefix. It stops after an error, and the API reports the message in the simulator status. The dashboard exposes start/stop in the top navigation.
-
-Because completion consumes ingredients, running the simulator drains stock: every simulated completion takes its dish's recipe out of the lots. Receiving is still manual, through the dashboard's receive form (the **+N** button prefills the amount that brings an ingredient back to par), and ad-hoc consume/waste still runs through the API.
-
-The recipes live in `Kitchen.RECIPES` in `python/kitchen.py` (mirrored in the demo store). Quantities are whole units of each ingredient, because lot `qty` is an `INTEGER` column, so portions are demo-sized, 1 kg of cheese per burger, to make the bars move visibly:
+The six recipes live in `Kitchen.RECIPES` in `python/kitchen.py`, with a copy in the demo store. A dish is matched by the part of its tag before the dash, so `BURGER-12` uses the BURGER recipe. Amounts are whole units, because a lot's `qty` is an `INTEGER` column, so the portions are oversized on purpose (1 kg of cheese per burger) to make the stock bars move visibly:
 
 | Dish | Uses |
 | --- | --- |
@@ -500,6 +551,21 @@ The recipes live in `Kitchen.RECIPES` in `python/kitchen.py` (mirrored in the de
 | SALAD | 1 kg tomato, 20 g basil |
 | PASTA | 1 kg flour, 1 kg tomato, 1 kg cheese, 10 g basil |
 | STEAK | 1 L oil, 10 g basil |
+
+## Load Simulation
+
+The simulator keeps the dashboard busy without a real kitchen behind it, so you can watch the station board and the stock levels change, and build up backlog and stock history for the API to return. It is stopped by default. Start and stop it with the **Start simulator** button in the dashboard header.
+
+Every 5 seconds it does one of two things:
+
+- **Completes a dish:** it picks a random ticket that the simulator fired itself and marks it done. That happens 45% of the time, or every time if no station is free. Completing the dish uses its recipe's ingredients, just like a cook tapping **Done**.
+- **Fires a dish:** otherwise, it fires a random dish at a random free station with a tag like `BURGER-A3`.
+
+It never completes tickets that a cook fired. If every station is busy with a cook's tickets, nothing changes that tick. If a request fails, it stops and the dashboard shows the error.
+
+Because every simulated dish uses ingredients, stock keeps falling while the simulator runs. It never restocks, so use **+N** to receive deliveries when items go low.
+
+> **Note:** In live mode the simulator writes real tickets, events, and stock changes to GridDB Cloud under your container prefix, and it uses up the stock you received. Use a dedicated prefix or database if you don't want sample data mixed with real data.
 
 ## Query Patterns and Examples
 
@@ -531,17 +597,6 @@ All reads go through `container.query(tql).fetch()` in `python/kitchen.py`. The 
 
 The `LIMIT 1001` reads are deliberate. Fetching one row past the expected maximum lets the worker detect overflow and fail loudly, instead of silently showing a partial board or under-counting stock. Time windows run against TimeSeries containers keyed by timestamp. Business records with stable IDs live in Collections, so retries and updates can fetch them directly with `get(key)`.
 
-## Verification
-
-From `apps/`:
-
-```bash
-npm run check
-npm test
-```
-
-Tests cover payload validation, fire/complete/receive/consume idempotency and conflicts, empty-lot and over-consume conflicts, recipe consumption on completion (first-expiring lot first, no double use on retry, shortfall warnings), response shapes, origin checks, and HTTP status codes through the real server. They run against the in-memory demo store, which mirrors `python/kitchen.py`; they do not exercise the Python worker or prove a live GridDB Cloud connection.
-
 ## Production Integration
 
 Station projections and stock samples are derived from app activity, not from sensors or POS data. A real deployment needs its own ingestion: ticket firing from the POS, lot receiving from the supplier flow, expiry sweeps, and reconciliation jobs for missed projections. Keep credentials, raw TQL, and container selection off the browser, and add operator auth, HTTPS, rate limits, and retention before any public deployment. The API only accepts writes from loopback origins, which is fine for a local tool but is not authentication.
@@ -556,9 +611,13 @@ Two operational notes. Each fire or complete writes the ticket, an event, a back
 - Waste analytics: waste share per ingredient and per station.
 - Multi-kitchen prefixes with a shared ingredient catalog.
 
-## Summary
+## Conclusion
 
-This kitchen monitor is built on Node.js plus a persistent Python worker plus GridDB Native: stations and tickets cover throughput, while ingredient lots, movements, and stock history answer whether the kitchen can keep cooking.
+In this tutorial, we built a kitchen monitor that answers two questions on one screen: which stations are free, and whether there is still enough stock to cook the next dish. Firing a dish, marking it done, and receiving a delivery each become a few rows in GridDB Cloud, and the dashboard reads them back every 5 seconds.
+
+A few design choices hold it together. Tickets and lots are the source of truth: they are saved first, and everything else (events, movements, backlog and stock history) is written after them, so a failed history write never loses an order. Every write that creates something carries an ID picked by the caller, so a retried request can't create a duplicate ticket or count a delivery twice. And one long-lived Python worker owns the native GridDB connection, so Node.js only ever exchanges small JSON lines with it.
+
+The same pattern carries beyond the demo. Swap the simulator for a POS feed and the receive form for a supplier delivery feed, and the containers, queries, and dashboard stay the same.
 
 ## Related Documentation
 
