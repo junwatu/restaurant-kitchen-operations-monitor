@@ -1,8 +1,6 @@
-# Restaurant Kitchen Operations Monitor (draft)
+# Restaurant Kitchen Operations Monitor
 
-Tracks kitchen stations, live tickets, completions, backlog history, and ingredient inventory on GridDB Native + Node.js.
-
-Stations: 12 across Grill (G), Fry (F), Pass (P). Tickets are fired to a station and completed when the dish leaves the station. A simulator generates one fire/complete event every 5 seconds (stopped by default).
+A live kitchen dashboard that shows which cooking stations are busy and which ingredients are running low. It uses a React dashboard and a Node.js server, and stores orders, stock, and their history in GridDB Cloud through GridDB's native client.
 
 ## Project structure
 
